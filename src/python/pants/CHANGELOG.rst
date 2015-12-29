@@ -1,6 +1,180 @@
 RELEASE HISTORY
 ===============
 
+
+0.0.65 (12/18/2015)
+-------------------
+
+Release Notes
+~~~~~~~~~~~~~
+
+This release concludes the deprecation cycle of the following items, now removed:
+
+* `--excludes` to `DuplicateDetector`.  Use `--exclude-files`, `--exclude-patterns`,
+  or `--exclude-dirs` instead.
+
+* `timeout=0` on test targets.  To use the default timeout, remove the `timeout`
+  parameter from your test target.
+
+
+API Changes
+~~~~~~~~~~~
+
+* prefer explicit jvm locations over internal heuristics
+  `RB #3231 <https://rbcommons.com/s/twitter/r/3231>`_
+
+* A graph_info backend.
+  `RB #3256 <https://rbcommons.com/s/twitter/r/3256>`_
+
+* Move registration of basic build file constructs.
+  `RB #3246 <https://rbcommons.com/s/twitter/r/3246>`_
+
+Bugfixes
+~~~~~~~~
+
+* Fixup `GoFetch` to respect transitive injections.
+  `RB #3270 <https://rbcommons.com/s/twitter/r/3270>`_
+
+* Make jvm_compile's subsystem dependencies global to fix ignored options
+  `Issue #2739 <https://github.com/pantsbuild/pants/issues/2739>`_
+  `RB #3238 <https://rbcommons.com/s/twitter/r/3238>`_
+
+New Features
+~~~~~~~~~~~~
+
+* Go Checkstyle: run checkstyle, add tests, fix examples
+  `RB #3223 <https://rbcommons.com/s/twitter/r/3223>`_
+
+Small improvements, Refactoring and Tooling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* Go: Allow users to specify known import prefixes for import paths.
+  `RB #3120 <https://rbcommons.com/s/twitter/r/3120>`_
+
+* Explains how append-style arguments work in pants
+  `RB #3268 <https://rbcommons.com/s/twitter/r/3268>`_
+
+* Allow specification of extra env vars for junit_tests runs.
+  `RB #3140 <https://rbcommons.com/s/twitter/r/3140>`_
+  `RB #3267 <https://rbcommons.com/s/twitter/r/3267>`_
+
+* Refactor help scope computation logic.
+  `RB #3264 <https://rbcommons.com/s/twitter/r/3264>`_
+
+* Make it easy for tests to use the "real" python interpreter cache.
+  `RB #3257 <https://rbcommons.com/s/twitter/r/3257>`_
+
+* Pass `--confcutdir` to py.test invocation to restrict `conftest.py` scanning to paths in the pants buildroot.
+  `RB #3258 <https://rbcommons.com/s/twitter/r/3258>`_
+
+* Remove stale `:all` alias used by plugin integration test
+  `RB #3254 <https://rbcommons.com/s/twitter/r/3254>`_
+
+* Move conflicting python test targets to testprojects.
+  `RB #3252 <https://rbcommons.com/s/twitter/r/3252>`_
+
+* Add convenience script for running unit tests, update docs
+  `RB #3233 <https://rbcommons.com/s/twitter/r/3233>`_
+  `RB #3248 <https://rbcommons.com/s/twitter/r/3248>`_
+
+0.0.64 (12/11/2015)
+-------------------
+
+Release Notes
+~~~~~~~~~~~~~
+
+This release concludes the deprecation cycle of the following items, now removed:
+
+* `dependencies` and `python_test_suite` target aliases
+  BUILD file authors should use `target` instead.
+
+* `pants.backend.core.tasks.{Task,ConsoleTask,ReplTaskMixin}`
+  Custom task authors can update imports to the new homes in `pants.task`
+
+* The `test.junit` `--no-suppress-output` option
+  You now specify `--output-mode=ALL` in the `test.junit` scope instead.
+
+This release also fixes issues using the Scala REPL via `./pants repl` for very
+large classpaths.
+
+API Changes
+~~~~~~~~~~~
+
+* Upgrade to junit-runner 1.0.0.
+  `RB #3232 <https://rbcommons.com/s/twitter/r/3232>`_
+
+* Remove deprecated `-suppress-output` flag.
+  `RB #3229 <https://rbcommons.com/s/twitter/r/3229>`_
+
+* Kill `dependencies`, `python_test_suite` and old task base class aliases.
+  `RB #3228 <https://rbcommons.com/s/twitter/r/3228>`_
+
+Bugfixes
+~~~~~~~~
+
+* Fixup the `NodePreinstalledModuleResolver`.
+  `RB #3240 <https://rbcommons.com/s/twitter/r/3240>`_
+
+* Prepend '//' to Address.spec when the spec_path is empty.
+  `RB #3234 <https://rbcommons.com/s/twitter/r/3234>`_
+
+* Fix problem with too long classpath while starting scala repl: python part
+  `RB #3195 <https://rbcommons.com/s/twitter/r/3195>`_
+
+* Fix problem with too long classpath while starting scala repl: java part
+  `RB #3194 <https://rbcommons.com/s/twitter/r/3194>`_
+
+* Fixing instrumentation classpath mutation to support multiple targets and entries.
+  `RB #3108 <https://rbcommons.com/s/twitter/r/3108>`_
+
+* Use target.id to create the stable classpath for bundle and export-classpath
+  `RB #3211 <https://rbcommons.com/s/twitter/r/3211>`_
+
+New Features
+~~~~~~~~~~~~
+
+* Add an option to write build stats into a local json file.
+  `RB #3218 <https://rbcommons.com/s/twitter/r/3218>`_
+
+* Make incremental compile optional for zinc
+  `RB #3226 <https://rbcommons.com/s/twitter/r/3226>`_
+
+* Create a test timeout_maximum flag so that we can prevent people from setting an insanely huge timeout
+  `RB #3219 <https://rbcommons.com/s/twitter/r/3219>`_
+
+* Add a jvm_prep_command that can work in compile, test, and binary goals
+  `RB #3209 <https://rbcommons.com/s/twitter/r/3209>`_
+
+Small improvements, Refactoring and Tooling
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* A docgen backend.
+  `RB #3242 <https://rbcommons.com/s/twitter/r/3242>`_
+
+* Add formatting of choices to help output
+  `RB #3241 <https://rbcommons.com/s/twitter/r/3241>`_
+
+* Remove test target aliases for pants' tests
+  `RB #3233 <https://rbcommons.com/s/twitter/r/3233>`_
+
+* Move resources() and prep_command() out of backend/core.
+  `RB #3235 <https://rbcommons.com/s/twitter/r/3235>`_
+
+* [pantsd] Implement PantsDaemon et al.
+  `RB #3224 <https://rbcommons.com/s/twitter/r/3224>`_
+
+* New implementation of `./pants targets`.
+  `RB #3214 <https://rbcommons.com/s/twitter/r/3214>`_
+
+* Allow alternate_target_roots to specify an empty collection
+  `RB #3216 <https://rbcommons.com/s/twitter/r/3216>`_
+
+* Remove group task and register zinc_compile directly
+  `RB #3215 <https://rbcommons.com/s/twitter/r/3215>`_
+
+* Bump the default Go distribution to 1.5.2.
+  `RB #3208 <https://rbcommons.com/s/twitter/r/3208>`_
+
 0.0.63 (12/04/2015)
 -------------------
 
