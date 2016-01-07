@@ -11,7 +11,6 @@ import itertools
 import os
 from collections import defaultdict
 
-from pants.backend.core.targets.resources import Resources
 from pants.backend.jvm.subsystems.java import Java
 from pants.backend.jvm.subsystems.jvm_platform import JvmPlatform
 from pants.backend.jvm.subsystems.scala_platform import ScalaPlatform
@@ -26,6 +25,7 @@ from pants.base.exceptions import TaskError
 from pants.base.fingerprint_strategy import TaskIdentityFingerprintStrategy
 from pants.base.worker_pool import WorkerPool
 from pants.base.workunit import WorkUnitLabel
+from pants.build_graph.resources import Resources
 from pants.build_graph.target import Target
 from pants.goal.products import MultipleRootedProducts
 from pants.option.custom_types import list_option
@@ -141,10 +141,6 @@ class JvmCompile(NailgunTaskBase):
              help='Capture compilation output to per-target logs.')
 
   @classmethod
-  def product_types(cls):
-    return ['runtime_classpath', 'classes_by_source', 'product_deps_by_src']
-
-  @classmethod
   def prepare(cls, options, round_manager):
     super(JvmCompile, cls).prepare(options, round_manager)
 
@@ -167,8 +163,8 @@ class JvmCompile(NailgunTaskBase):
   _supports_concurrent_execution = None
 
   @classmethod
-  def task_subsystems(cls):
-    return super(JvmCompile, cls).task_subsystems() + (Java, JvmPlatform, ScalaPlatform)
+  def subsystem_dependencies(cls):
+    return super(JvmCompile, cls).subsystem_dependencies() + (Java, JvmPlatform, ScalaPlatform)
 
   @classmethod
   def name(cls):
@@ -204,7 +200,7 @@ class JvmCompile(NailgunTaskBase):
   def cache_target_dirs(self):
     return True
 
-  def select(self):
+  def select(self, target):
     raise NotImplementedError()
 
   def select_source(self, source_file_path):
@@ -325,10 +321,7 @@ class JvmCompile(NailgunTaskBase):
     # In case we have no relevant targets and return early create the requested product maps.
     self._create_empty_products()
 
-    def select_target(target):
-      return self.select(target)
-
-    relevant_targets = list(self.context.targets(predicate=select_target))
+    relevant_targets = list(self.context.targets(predicate=self.select))
 
     if not relevant_targets:
       return

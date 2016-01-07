@@ -1,22 +1,6 @@
 # Copyright 2014 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-target(
-  name = 'util',
-  dependencies = [
-    ':contextutil',
-    ':dirutil',
-    ':eval',
-    ':fileutil',
-    ':memo',
-    ':meta',
-    ':osutil',
-    ':strutil',
-    ':xml_parser',
-    ':timeout',
-  ]
-)
-
 python_tests(
   name = 'contextutil',
   sources = ['test_contextutil.py'],
@@ -111,7 +95,7 @@ python_tests(
   sources = ['test_timeout.py'],
   dependencies = [
     'src/python/pants/util:timeout',
-  ],
+  ]
 )
 
 python_tests(
@@ -121,5 +105,13 @@ python_tests(
   dependencies = [
     '3rdparty/python:mock',
     'src/python/pants/util:socket',
-  ],
+  ]
+)
+
+python_tests(
+  name = 'process_handler',
+  sources = ['test_process_handler.py'],
+  dependencies = [
+    'src/python/pants/util:process_handler'
+  ]
 )

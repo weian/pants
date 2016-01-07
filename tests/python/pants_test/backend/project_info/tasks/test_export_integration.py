@@ -215,7 +215,7 @@ class ExportIntegrationTest(ResolveJarsTestMixin, PantsRunIntegrationTest):
 
   def test_intellij_integration(self):
     with self.temporary_workdir() as workdir:
-      targets = ['src/python/::', 'tests/python/pants_test:all', 'contrib/::']
+      targets = ['src/python/::', 'tests/python/pants_test/base::', 'contrib/::']
       excludes = [
         '--exclude-target-regexp=.*go/examples.*',
         '--exclude-target-regexp=.*scrooge/tests/thrift.*',
@@ -234,6 +234,6 @@ class ExportIntegrationTest(ResolveJarsTestMixin, PantsRunIntegrationTest):
       self.assertTrue(os.path.exists(python_setup['interpreters'][default_interpreter]['binary']))
       self.assertTrue(os.path.exists(python_setup['interpreters'][default_interpreter]['chroot']))
 
-      core_target = json_data['targets']['src/python/pants/backend/core:core']
+      core_target = json_data['targets']['src/python/pants/backend/core:plugin']
       self.assertIsNotNone(core_target)
       self.assertEquals(default_interpreter, core_target['python_interpreter'])

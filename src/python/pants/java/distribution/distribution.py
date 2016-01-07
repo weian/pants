@@ -16,7 +16,7 @@ from contextlib import contextmanager
 from six import string_types
 
 from pants.base.revision import Revision
-from pants.java.util import execute_java
+from pants.java.util import execute_java, execute_java_async
 from pants.option.custom_types import dict_option
 from pants.subsystem.subsystem import Subsystem
 from pants.util.contextutil import temporary_dir
@@ -218,6 +218,9 @@ class Distribution(object):
   def execute_java(self, *args, **kwargs):
     return execute_java(*args, distribution=self, **kwargs)
 
+  def execute_java_async(self, *args, **kwargs):
+    return execute_java_async(*args, distribution=self, **kwargs)
+
   def _get_version(self, java):
     if not self._version:
       self._version = self._parse_java_version('java.version',
@@ -402,9 +405,15 @@ class DistributionLocator(Subsystem):
   def locate(cls, minimum_version=None, maximum_version=None, jdk=False):
     """Finds a java distribution that meets any given constraints and returns it.
 
-    First looks through the paths listed for this operating system in the --jvm-distributions-paths
-    map. Then looks in JDK_HOME and JAVA_HOME if defined, falling back to a search on the PATH.
-    Raises Distribution.Error if no suitable java distribution could be found.
+    Distributions are searched for in the following order:
+     * Paths listed for this operating system in the
+    --jvm-distributions-paths map
+     * JDK_HOME/JAVA_HOME
+     * PATH
+     * Likely locations on the file system such as /usr/lib/jvm
+
+    :raises: Distribution.Error if no suitable java distribution could
+    be found.
     :param minimum_version: minimum jvm version to look for (eg, 1.7).
     :param maximum_version: maximum jvm version to look for (eg, 1.7.9999).
     :param bool jdk: whether the found java distribution is required to have a jdk.
@@ -484,13 +493,13 @@ class DistributionLocator(Subsystem):
     yield env_home('JDK_HOME')
     yield env_home('JAVA_HOME')
 
+    search_path = os.environ.get('PATH')
+    if search_path:
+      for bin_path in search_path.strip().split(os.pathsep):
+        yield cls._Location.from_bin(bin_path)
+
     for location in cls._linux_java_homes():
       yield location
 
     for location in cls._osx_java_homes():
       yield location
-
-    search_path = os.environ.get('PATH')
-    if search_path:
-      for bin_path in search_path.strip().split(os.pathsep):
-        yield cls._Location.from_bin(bin_path)

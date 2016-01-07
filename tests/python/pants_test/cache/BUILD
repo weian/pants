@@ -1,18 +1,6 @@
 # Copyright 2014 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-target(
-  name = 'cache',
-  dependencies = [
-    ':artifact',
-    ':artifact_cache',
-    ':cache_setup',
-    ':delay_server',
-    ':pinger',
-    ':resolver',
-  ]
-)
-
 python_tests(
   name = 'artifact',
   sources = ['test_artifact.py'],
@@ -46,6 +34,20 @@ python_tests(
     'tests/python/pants_test:base_test',
     'tests/python/pants_test/testutils:mock_logger',
   ]
+)
+
+python_tests(
+  name = 'caching',
+  sources = ['test_caching.py'],
+  dependencies = [
+    'src/python/pants/task:task',
+    'src/python/pants/base:build_environment',
+    'src/python/pants/base:payload',
+    'src/python/pants/build_graph:build_graph',
+    'src/python/pants/cache:cache',
+    'src/python/pants/util:dirutil',
+    'tests/python/pants_test/tasks:task_test_base',
+  ],
 )
 
 python_library(
