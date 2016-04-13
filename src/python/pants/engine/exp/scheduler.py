@@ -5,873 +5,618 @@
 from __future__ import (absolute_import, division, generators, nested_scopes, print_function,
                         unicode_literals, with_statement)
 
-import collections
-import inspect
-import itertools
-from abc import abstractmethod, abstractproperty
-from collections import defaultdict, namedtuple
+import logging
+import os
+import sys
+import threading
+from collections import defaultdict
 
 import six
-from twitter.common.collections import OrderedSet
 
+from pants.base.specs import DescendantAddresses, SiblingAddresses, SingleAddress
 from pants.build_graph.address import Address
-from pants.engine.exp.addressable import extract_config_selector
-from pants.engine.exp.objects import Serializable
-from pants.engine.exp.products import Products, Sources, lift_native_product
-from pants.util.memo import memoized_property
-from pants.util.meta import AbstractClass
-
-
-class Subject(object):
-  """The subject of a production plan."""
-
-  @classmethod
-  def as_subject(cls, item):
-    """Return the given item as the primary of a subject if its not already a subject.
-
-    :rtype: :class:`Subject`
-    """
-    return item if isinstance(item, Subject) else cls(primary=item)
-
-  def __init__(self, primary, alternate=None):
-    """
-    :param primary: The primary subject of a production plan.
-    :param alternate: An alternate subject as suggested by some other plan.
-    """
-    self._primary = primary
-    self._alternate = alternate
-
-  @property
-  def primary(self):
-    """Return the primary subject."""
-    return self._primary
-
-  @property
-  def iter_derivations(self):
-    """Iterates over all subjects.
-
-    The primary subject will always be returned as the 1st item from the iterator and if there is
-    an alternate, it will be returned next.
-
-    :rtype: :class:`collection.Iterator`
-    """
-    yield self._primary
-    if self._alternate:
-      yield self._alternate
-
-  def __hash__(self):
-    return hash(self._primary)
-
-  def __eq__(self, other):
-    return isinstance(other, Subject) and self._primary == other._primary
-
-  def __ne__(self, other):
-    return not (self == other)
-
-  def __repr__(self):
-    return 'Subject(primary={!r}, alternate={!r})'.format(self._primary, self._alternate)
-
-
-class Binding(namedtuple('Binding', ['func', 'args', 'kwargs'])):
-  """A binding for a plan that can be executed."""
-
-  def execute(self):
-    """Execute this binding and return the result."""
-    return self.func(*self.args, **self.kwargs)
-
-
-class TaskCategorization(namedtuple('TaskCategorization', ['func', 'task_type'])):
-  """An Either type for a function or `Task` type."""
-
-  @classmethod
-  def of_func(cls, func):
-    return cls(func=func, task_type=None)
-
-  @classmethod
-  def of_task_type(cls, task_type):
-    return cls(func=None, task_type=task_type)
-
-  @property
-  def value(self):
-    """Return the underlying func or task type.
-
-    :rtype: function|type
-    """
-    return self.func or self.task_type
-
-
-def _categorize(func_or_task_type):
-  if isinstance(func_or_task_type, TaskCategorization):
-    return func_or_task_type
-  elif inspect.isclass(func_or_task_type):
-    if not issubclass(func_or_task_type, Task):
-      raise ValueError('A task must be a function or else a subclass of Task, given type {}'
-                       .format(func_or_task_type.__name__))
-    return TaskCategorization.of_task_type(func_or_task_type)
-  else:
-    return TaskCategorization.of_func(func_or_task_type)
-
-
-def _execute_binding(categorization, **kwargs):
-  # A picklable top-level function to help support local multiprocessing uses.
-  # TODO(John Sirois): Plumb (context, workdir) or equivalents to the task_type constructor if
-  # maintaining Task as a bridge to convert old style tasks makes sense.  Otherwise, simplify
-  # things and only accept a func.
-  function = categorization.func if categorization.func else categorization.task_type().execute
-  return function(**kwargs)
-
-
-class Plan(Serializable):
-  """Represents an production plan that will yield a given product type for one or more subjects.
-
-  A plan can be serialized and executed wherever its task type and and source inputs it needs are
-  available.
-  """
-  # TODO(John Sirois): Sources are currently serialized as paths relative to the build root, but
-  # they could also be serialized a a path + blob.  Talks about distributed backend solutions will
-  # shake out if we need this in the near term.  Even if we only need paths for remote execution,
-  # it probably makes sense to ship a path + hash pair so a remote build can fail fast if its source
-  # inputs don't match local expectations.
-  # NB: We don't ship around toolchains, just requirements of them as specified in plan inputs, like
-  # the apache thrift compiler version.  There may need to be a protocol as a result that
-  # pre-screens remote nodes for the capability to execute a given plan in-general (some nodes may
-  # have a required toolchain but some may not and pants may have no intrinsic to fetch the
-  # toolchain).  For example, pants can intrinsically fetch the Go toolchain in a Task today but it
-  # cannot do the same for the jdk and instead only asserts its presence.
-
-  def __init__(self, func_or_task_type, subjects, **inputs):
-    """
-    :param type func_or_task_type: The function that will execute this plan or else a :class:`Task`
-                                   subclass.
-    :param subjects: The subjects the plan will generate products for.
-    :type subjects: :class:`collections.Iterable` of :class:`Subject` or else objects that will
-                    be converted to the primary of a `Subject`.
-    """
-    self._func_or_task_type = _categorize(func_or_task_type)
-    self._subjects = frozenset(Subject.as_subject(subject) for subject in subjects)
-    self._inputs = inputs
-
-  @property
-  def func_or_task_type(self):
-    """Return the function or `Task` type that will execute this plan.
-
-    :rtype: :class:`TaskCategorization`
-    """
-    return self._func_or_task_type
-
-  @property
-  def subjects(self):
-    """Return the subjects of this plan.
-
-    When the plan is executed, its results will be associated with each one of these subjects.
-
-    :rtype: frozenset of :class:`Subject`
-    """
-    return self._subjects
-
-  def __getattr__(self, item):
-    if item in self._inputs:
-      return self._inputs[item]
-    raise AttributeError('{} does not have attribute {!r}'.format(self, item))
-
-  @staticmethod
-  def _is_mapping(value):
-    return isinstance(value, collections.Mapping)
-
-  @staticmethod
-  def _is_iterable(value):
-    return isinstance(value, collections.Iterable) and not isinstance(value, six.string_types)
-
-  @memoized_property
-  def promises(self):
-    """Return an iterator over the unique promises in this plan's inputs.
-
-    A plan's promises indicate its dependency edges on other plans.
-
-    :rtype: :class:`collections.Iterator` of :class:`Promise`
-    """
-    def iter_promises(item):
-      if isinstance(item, Promise):
-        yield item
-      elif self._is_mapping(item):
-        for _, v in item.items():
-          for p in iter_promises(v):
-            yield p
-      elif self._is_iterable(item):
-        for i in item:
-          for p in iter_promises(i):
-            yield p
-
-    promises = set()
-    for _, value in self._inputs.items():
-      promises.update(iter_promises(value))
-    return promises
-
-  def bind(self, products_by_promise):
-    """Bind this plans inputs to functions arguments.
-
-    :param products_by_promise: A mapping containing this plan's satisfied promises.
-    :type products_by_promise: dict of (:class:`Promise`, product)
-    :returns: A binding for this plan to the given satisfied promises.
-    :rtype: :class:`Binding`
-    """
-    def bind_products(item):
-      if isinstance(item, Promise):
-        return products_by_promise[item]
-      elif self._is_mapping(item):
-        return {k: bind_products(v) for k, v in item.items()}
-      elif self._is_iterable(item):
-        return [bind_products(i) for i in item]
-      else:
-        return item
-
-    inputs = {}
-    for key, value in self._inputs.items():
-      inputs[key] = bind_products(value)
-
-    return Binding(_execute_binding, args=(self._func_or_task_type,), kwargs=inputs)
-
-  def _asdict(self):
-    d = self._inputs.copy()
-    d.update(func_or_task_type=self._func_or_task_type, subjects=tuple(self._subjects))
-    return d
-
-  def _key(self):
-    def hashable(value):
-      if self._is_mapping(value):
-        return tuple(sorted((k, hashable(v)) for k, v in value.items()))
-      elif self._is_iterable(value):
-        return tuple(hashable(v) for v in value)
-      else:
-        return value
-    return self._func_or_task_type, self._subjects, hashable(self._inputs)
-
-  def __hash__(self):
-    return hash(self._key())
-
-  def __eq__(self, other):
-    return isinstance(other, Plan) and self._key() == other._key()
-
-  def __ne__(self, other):
-    return not (self == other)
-
-  def __repr__(self):
-    return ('Plan(func_or_task_type={!r}, subjects={!r}, inputs={!r})'
-            .format(self._func_or_task_type, self._subjects, self._inputs))
-
-
-class SchedulingError(Exception):
-  """Indicates inability to make a scheduling promise."""
-
-
-class NoProducersError(SchedulingError):
-  """Indicates no planners were able to promise a product for a given subject."""
-
-  def __init__(self, product_type, subject=None):
-    msg = ('No plans to generate {!r}{} could be made.'
-            .format(product_type.__name__, ' {!r}'.format(subject) if subject else ''))
-    super(NoProducersError, self).__init__(msg)
-
-
-class PartiallyConsumedInputsError(SchedulingError):
-  """No planner was able to produce a plan that consumed the given input products."""
-
-  @staticmethod
-  def msg(output_product, subject, partially_consumed_products):
-    yield 'While attempting to produce {} for {}, some products could not be consumed:'.format(
-             output_product.__name__, subject)
-    for input_product, planners in partially_consumed_products.items():
-      yield '  To consume {}:'.format(input_product.__name__)
-      for planner, additional_inputs in planners.items():
-        inputs_str = ' OR '.join(i.__name__ for i in additional_inputs)
-        yield '    {} needed ({})'.format(type(planner).__name__, inputs_str)
-
-  def __init__(self, output_product, subject, partially_consumed_products):
-    msg = '\n'.join(self.msg(output_product, subject, partially_consumed_products))
-    super(PartiallyConsumedInputsError, self).__init__(msg)
-
-
-class ConflictingProducersError(SchedulingError):
-  """Indicates more than one planner was able to promise a product for a given subject.
-
-  TODO: This will need to be legal in order to support multiple Planners producing a
-  (mergeable) Classpath for one subject, for example.
-  """
-
-  def __init__(self, product_type, subject, planners):
-    msg = ('Collected the following plans for generating {!r} from {!r}\n\t{}'
-            .format(product_type.__name__,
-                    subject,
-                    '\n\t'.join(type(p).__name__ for p in planners)))
-    super(ConflictingProducersError, self).__init__(msg)
-
-
-class Scheduler(AbstractClass):
-  """Schedule the creation of products."""
-
-  @abstractmethod
-  def promise(self, subject, product_type, configuration=None):
-    """Return an promise for a product of the given `product_type` for the given `subject`.
-
-    The subject can either be a :class:`pants.engine.exp.objects.Serializable` object or else an
-    :class:`Address`, in which case the promise subject is the addressable, serializable object it
-    points to.
-
-    If a configuration is supplied, the promise is for the requested product in that configuration.
-
-    If no production plans can be made a :class:`Scheduler.SchedulingError` is raised.
-
-    :param object subject: The subject that the product type should be created for.
-    :param type product_type: The type of product to promise production of for the given subject.
-    :param object configuration: An optional requested configuration for the product.
-    :returns: A promise to make the given product type available for subject at task execution time.
-    :rtype: :class:`Promise`
-    :raises: :class:`SchedulerError` if no production plans could be made.
-    """
-
-
-class TaskPlanner(AbstractClass):
-  """Produces plans to control execution of a paired task."""
-
-  class Error(Exception):
-    """Indicates an error creating a product plan for a subject."""
-
-  @classmethod
-  def iter_configured_dependencies(cls, subject):
-    """Return an iterator of the given subject's dependencies including any selected configurations.
-
-    If no configuration is selected by a dependency (there is no `@[config-name]` specifier suffix),
-    then `None` is returned for the paired configuration object; otherwise the `[config-name]` is
-    looked for in the subject `configurations` list and returned if found or else an error is
-    raised.
-
-    :returns: An iterator over subjects dependencies as pairs of (dependency, configuration).
-    :rtype: :class:`collections.Iterator` of (object, string)
-    :raises: :class:`TaskPlanner.Error` if a dependency configuration was selected by subject but
-             could not be found or was not unique.
-    """
-    for derivation in Subject.as_subject(subject).iter_derivations:
-      if derivation.dependencies:
-        for dep in derivation.dependencies:
-          configuration = None
-          if dep.address:
-            config_specifier = extract_config_selector(dep.address)
-            if config_specifier:
-              if not dep.configurations:
-                raise cls.Error('The dependency of {dependee} on {dependency} selects '
-                                'configuration {config} but {dependency} has no configurations.'
-                                .format(dependee=derivation,
-                                        dependency=dep,
-                                        config=config_specifier))
-              configuration = dep.select_configuration(config_specifier)
-          yield dep, configuration
-
-  @abstractproperty
-  def goal_name(self):
-    """Return the name of the goal this planner's task should run from.
-
-    :rtype: string
-    """
-
-  @abstractproperty
-  def product_types(self):
-    """Return a dict from output products to input product requirements for this planner.
-
-    Product requirements are represented in disjunctive normal form (DNF). There are two
-    levels of nested lists: the outer list represents clauses that are ORed; the inner
-    list represents type matches that are ANDed.
-
-    TODO: dsl for this?
-    """
-
-  @abstractmethod
-  def plan(self, scheduler, product_type, subject, configuration=None):
-    """
-    :param scheduler: A scheduler that can supply promises for any inputs needed that the planner
-                      cannot supply on its own to its associated task.
-    :type scheduler: :class:`Scheduler`
-    :param type product_type: The type of product this plan should produce given subject when
-                              executed.
-    :param object subject: The subject of the plan.  Any products produced will be for the subject.
-    :param object configuration: An optional requested configuration for the product.
-    """
-
-  def finalize_plans(self, plans):
-    """Subclasses can override to finalize the plans they created.
-
-    :param plans: All the plans emitted by this planner for the current planning session.
-    :type plans: :class:`collections.Iterable` of :class:`Plan`
-    :returns: A possibly different iterable of plans.
-    :rtype: :class:`collections.Iterable` of :class:`Plan`
-    """
-    return plans
-
-
-class Task(object):
-  """An executable task.
-
-  Tasks form the atoms of work done by pants and when executed generally produce artifacts as a
-  side effect whether these be files on disk (for example compilation outputs) or characters output
-  to the terminal (for example dependency graph metadata).  These outputs are always represented
-  by a product type - sometimes `None`.  The product type instances the task returns can often be
-  used to access the contents side-effect outputs.
-  """
-
-  def execute(self, **inputs):
-    """Executes this task."""
-
-
-# TODO: Extract to a separate file in a followup review.
-class Planners(object):
-  """A registry of task planners indexed by both product type and goal name.
-
-  Holds a set of input product requirements for each output product, which can be used
-  to validate the graph.
-  """
-
-  def __init__(self, planners):
-    """
-    :param planners: All the task planners registered in the system.
-    :type planners: :class:`collections.Iterable` of :class:`TaskPlanner`
-    """
-    self._planners_by_goal_name = defaultdict(set)
-    self._product_requirements = defaultdict(dict)
-    self._output_products = set()
-    for planner in planners:
-      self._planners_by_goal_name[planner.goal_name].add(planner)
-      for output_type, input_type_requirements in planner.product_types.items():
-        self._product_requirements[output_type][planner] = input_type_requirements
-        self._output_products.add(output_type)
-
-  def for_goal(self, goal_name):
-    """Return the set of task planners installed in the given goal.
-
-    :param string goal_name:
-    :rtype: set of :class:`TaskPlanner`
-    """
-    return self._planners_by_goal_name[goal_name]
-
-  def for_product_type_and_subject(self, product_type, subject, configuration=None):
-    """Return the set of task planners that can produce the given product type for the subject.
-
-    TODO: memoize.
-
-    :param type product_type: The product type the returned planners are capable of producing.
-    :param subject: The subject that the product will be produced for.
-    :param configuration: An optional configuration to require that a planner consumes, or None.
-    :rtype: set of :class:`TaskPlanner`
-    """
-    input_products = list(Products.for_subject(subject))
-
-    partially_consumed_candidates = defaultdict(lambda: defaultdict(set))
-    for planner, ored_clauses in self._product_requirements[product_type].items():
-      fully_consumed = set()
-      if not self._apply_product_requirement_clauses(input_products,
-                                                     planner,
-                                                     ored_clauses,
-                                                     fully_consumed,
-                                                     partially_consumed_candidates):
-        continue
-      # Only yield planners that were recursively able to consume the configuration.
-      # TODO: This is matching on type only, while selectors are usually implemented
-      # as by-name. Convert config selectors to configuration mergers.
-      if not configuration or type(configuration) in fully_consumed:
-        yield planner
-
-  def _apply_product_requirement_clauses(self,
-                                         input_products,
-                                         planner,
-                                         ored_clauses,
-                                         fully_consumed,
-                                         partially_consumed_candidates):
-    for anded_clause in ored_clauses:
-      # Determine which of the anded clauses can be satisfied.
-      matched = [self._apply_product_requirements(product_req,
-                                                  input_products,
-                                                  fully_consumed,
-                                                  partially_consumed_candidates)
-                 for product_req in anded_clause]
-      matched_count = sum(1 for match in matched if match)
-
-      if matched_count == len(anded_clause):
-        # If all product requirements in the clause are satisfied by the input products, then
-        # we've found a planner capable of producing this product.
-        fully_consumed.update(anded_clause)
-        return True
-      elif matched_count > 0:
-        # On the other hand, if only some of the products from the clause were matched, collect
-        # the partially consumed values.
-        consumed = set()
-        unconsumed = set()
-        for requirement, was_consumed in zip(anded_clause, matched):
-          (consumed if was_consumed else unconsumed).add(requirement)
-        for consumed_product in consumed:
-          partially_consumed_candidates[consumed_product][planner].update(unconsumed)
-    return False
-
-  def _apply_product_requirements(self,
-                                  output_product_type,
-                                  input_products,
-                                  fully_consumed,
-                                  partially_consumed_candidates):
-    """Determines whether the output product can be computed by the planners with the given inputs.
-
-    Returns a boolean indicating whether the value can be produced. Mutates the fully consumed
-    product set, and a dict(product,dict(planner,list(product))) of partially consumed products.
-    """
-    if output_product_type in input_products:
-      # Requirement is directly satisfied.
-      return True
-    elif output_product_type not in self._output_products:
-      # Requirement can't be satisfied.
-      return False
+from pants.engine.exp.addressable import Addresses
+from pants.engine.exp.fs import Path, PathGlobs, Paths
+from pants.engine.exp.nodes import (DependenciesNode, FilesystemNode, Node, Noop, ProjectionNode,
+                                    Return, SelectNode, State, StepContext, TaskNode, Throw,
+                                    Waiting)
+from pants.engine.exp.objects import Closable
+from pants.engine.exp.selectors import (Select, SelectDependencies, SelectLiteral, SelectProjection,
+                                        SelectVariant)
+from pants.util.objects import datatype
+
+
+logger = logging.getLogger(__name__)
+
+
+class ProductGraph(object):
+
+  def __init__(self, validator=None):
+    self._validator = validator or Node.validate_node
+
+    # A dict from Node to its computed value: if a Node hasn't been computed yet, it will not
+    # be present here.
+    self._node_results = dict()
+    # Dicts from Nodes to sets of dependency/dependent Nodes.
+    self._dependencies = defaultdict(set)
+    self._dependents = defaultdict(set)
+    # Illegal/cyclic dependencies. We prevent cyclic dependencies from being introduced into the
+    # dependencies/dependents lists themselves, but track them independently in order to provide
+    # context specific error messages when they are introduced.
+    self._cyclic_dependencies = defaultdict(set)
+
+  def __len__(self):
+    return len(self._dependents)
+
+  def _set_state(self, node, state):
+    existing_state = self._node_results.get(node, None)
+    if existing_state is not None:
+      raise ValueError('Node {} is already completed:\n  {}\n  {}'
+                       .format(node, existing_state, state))
+    elif type(state) not in [Return, Throw, Noop]:
+      raise ValueError('Cannot complete Node {} with state {}'.format(node, state))
+    self._node_results[node] = state
+
+  def is_complete(self, node):
+    return node in self._node_results
+
+  def state(self, node):
+    return self._node_results.get(node, None)
+
+  def update_state(self, node, state):
+    """Updates the Node with the given State."""
+    if type(state) in [Return, Throw, Noop]:
+      self._set_state(node, state)
+    elif type(state) is Waiting:
+      self._add_dependencies(node, state.dependencies)
     else:
-      # Requirement might be possible to satisfy by requesting additional products.
-      matched = False
-      for planner, ored_clauses in self._product_requirements[output_product_type].items():
-        matched |= self._apply_product_requirement_clauses(input_products,
-                                                           planner,
-                                                           ored_clauses,
-                                                           fully_consumed,
-                                                           partially_consumed_candidates)
-      return matched
+      raise State.raise_unrecognized(state)
 
-  def produced_types_for_subject(self, subject, output_product_types):
-    """Filters the given list of output products to those that are actually possible to produce.
+  def _detect_cycle(self, src, dest):
+    """Given a src and a dest, each of which _might_ already exist in the graph, detect cycles.
 
-    This method additionally validates that there are no "partially consumed" input products.
-    A partially consumed input product is a product where no planner successfully consumes the
-    product, but at least one planner would consume it given some other missing input.
-
-    Note that this does not validate dependency subjects of the input subject, so it is necessary
-    to validate every call to `def promise` against these requirements.
+    Returns True if a cycle would be created by adding an edge from src->dest.
     """
-    input_products = list(Products.for_subject(subject))
+    parents = set()
+    walked = set()
+    def _walk(node):
+      if node in parents:
+        return True
+      if node in walked:
+        return False
+      parents.add(node)
+      walked.add(node)
 
-    producible_output_types = list()
-    fully_consumed = set()
-    partially_consumed_candidates = defaultdict(lambda: defaultdict(set))
-    for output_product_type in output_product_types:
-      if self._apply_product_requirements(output_product_type,
-                                          input_products,
-                                          fully_consumed,
-                                          partially_consumed_candidates):
-        producible_output_types.append(output_product_type)
+      for dep in self.dependencies_of(node):
+        found = _walk(dep)
+        if found:
+          return found
+      parents.discard(node)
+      return False
 
-    # If any partially consumed candidate was not fully consumed by some planner, it's an error.
-    partially_consumed = {product: partials
-                          for product, partials in partially_consumed_candidates.items()
-                          if product not in fully_consumed}
-    if partially_consumed:
-      raise PartiallyConsumedInputsError(output_product_type, subject, partially_consumed)
+    # Initialize the path with src (since the edge from src->dest may not actually exist), and
+    # then walk from the dest.
+    parents.add(src)
+    return _walk(dest)
 
-    return producible_output_types
+  def _add_dependencies(self, node, dependencies):
+    """Adds dependency edges from the given src Node to the given dependency Nodes.
 
-
-class BuildRequest(object):
-  """Describes the user-requested build."""
-
-  def __init__(self, goals, addressable_roots):
+    Executes cycle detection: if adding one of the given dependencies would create
+    a cycle, then the _source_ Node is marked as a Noop with an error indicating the
+    cycle path, and the dependencies are not introduced.
     """
-    :param goals: The list of goal names supplied on the command line.
-    :type goals: list of string
-    :param addressable_roots: The list of addresses supplied on the command line.
-    :type addressable_roots: list of :class:`pants.build_graph.address.Address`
+    self._validator(node)
+    if self.is_complete(node):
+      raise ValueError('Node {} is already completed, and cannot be updated.'.format(node))
+
+    # Add deps. Any deps which would cause a cycle are added to _cyclic_dependencies instead,
+    # and ignored except for the purposes of Step execution.
+    node_dependencies = self._dependencies[node]
+    node_cyclic_dependencies = self._cyclic_dependencies[node]
+    for dependency in dependencies:
+      if dependency in node_dependencies:
+        continue
+      self._validator(dependency)
+      if self._detect_cycle(node, dependency):
+        node_cyclic_dependencies.add(dependency)
+      else:
+        node_dependencies.add(dependency)
+        self._dependents[dependency].add(node)
+        # 'touch' the dependencies dict for this dependency, to ensure that an entry exists.
+        self._dependencies[dependency]
+
+  def completed_nodes(self):
+    return self._node_results
+
+  def dependents(self):
+    return self._dependents
+
+  def dependencies(self):
+    return self._dependencies
+
+  def cyclic_dependencies(self):
+    return self._cyclic_dependencies
+
+  def dependents_of(self, node):
+    return self._dependents[node]
+
+  def dependencies_of(self, node):
+    return self._dependencies[node]
+
+  def cyclic_dependencies_of(self, node):
+    return self._cyclic_dependencies[node]
+
+  def invalidate(self, predicate=None):
+    """Invalidate nodes and their subgraph of dependents given a predicate.
+
+    :param func predicate: A predicate that matches Node objects for all nodes in the graph.
     """
-    self._goals = goals
-    self._addressable_roots = addressable_roots
+    def _sever_dependents(node):
+      for associated in self._dependencies[node]:
+        self._dependents[associated].discard(node)
 
-  @property
-  def goals(self):
-    """Return the list of goal names supplied on the command line.
+    def _delete_node(node):
+      del self._node_results[node]
+      del self._dependents[node]
+      del self._dependencies[node]
+      self._cyclic_dependencies.pop(node, None)
 
-    :rtype: list of string
+    def all_predicate(_): return True
+    predicate = predicate or all_predicate
+
+    invalidated_roots = list(node for node in self._node_results.keys() if predicate(node))
+    invalidated_nodes = list(node for (node, _), _ in self.walk(roots=invalidated_roots,
+                                                                predicate=all_predicate,
+                                                                dependents=True))
+
+    # Sever dependee->dependent relationships in the graph for all given invalidated nodes.
+    for node in invalidated_nodes:
+      _sever_dependents(node)
+
+    # Delete all nodes based on a backwards walk of the graph from all matching invalidated roots.
+    for node in invalidated_nodes:
+      logger.debug('invalidating node: %r', node)
+      _delete_node(node)
+
+    invalidated_count = len(invalidated_nodes)
+    logger.info('invalidated {} nodes'.format(invalidated_count))
+    return invalidated_count
+
+  def _generate_fsnode_subjects(self, filenames):
+    """Given filenames, generate a set of subjects for invalidation predicate matching."""
+    file_paths = ((six.text_type(f), six.text_type(os.path.dirname(f))) for f in filenames)
+    for file_path, parent_dir_path in file_paths:
+      yield Path(file_path)
+      yield Path(parent_dir_path)  # Invalidate the parent dirs DirectoryListing.
+
+  def invalidate_files(self, filenames):
+    """Given a set of changed filenames, invalidate all related FilesystemNodes in the graph."""
+    subjects = set(self._generate_fsnode_subjects(filenames))
+    logger.debug('generated invalidation subjects: %s', subjects)
+
+    def predicate(node):
+      return type(node) is FilesystemNode and node.subject in subjects
+
+    return self.invalidate(predicate)
+
+  def walk(self, roots, predicate=None, dependents=False):
+    """Yields Nodes depth-first in pre-order, starting from the given roots.
+
+    Each node entry is actually a tuple of (Node, State), and each yielded value is
+    a tuple of (node_entry, dep_node_entries).
+
+    The given predicate is applied to entries, and eliminates the subgraphs represented by nodes
+    that don't match it. The default predicate eliminates all `Noop` subgraphs.
+
+    TODO: Not very many consumers actually need the dependency list here: should drop it and
+    allow them to request it specifically.
     """
-    return self._goals
+    def _default_walk_predicate(entry):
+      node, state = entry
+      return type(state) is not Noop
+    predicate = predicate or _default_walk_predicate
 
-  @property
-  def addressable_roots(self):
-    """Return the list of addresses supplied on the command line.
+    def _filtered_entries(nodes):
+      all_entries = [(n, self.state(n)) for n in nodes]
+      if not predicate:
+        return all_entries
+      return [entry for entry in all_entries if predicate(entry)]
 
-    :rtype: list of :class:`pants.build_graph.address.Address`
+    walked = set()
+    adjacencies = self.dependents_of if dependents else self.dependencies_of
+    def _walk(entries):
+      for entry in entries:
+        node, state = entry
+        if node in walked:
+          continue
+        walked.add(node)
+
+        deps = _filtered_entries(adjacencies(node))
+        yield (entry, deps)
+        for e in _walk(deps):
+          yield e
+
+    for entry in _walk(_filtered_entries(roots)):
+      yield entry
+
+  def visualize(self, roots):
+    """Visualize a graph walk by generating graphviz `dot` output.
+
+    :param iterable roots: An iterable of the root nodes to begin the graph walk from.
     """
-    return self._addressable_roots
+    viz_colors = {}
+    viz_color_scheme = 'set312'  # NB: There are only 12 colors in `set312`.
+    viz_max_colors = 12
 
-  def __repr__(self):
-    return ('BuildRequest(goals={!r}, addressable_roots={!r})'
-            .format(self._goals, self._addressable_roots))
+    def format_color(node, node_state):
+      if type(node_state) is Throw:
+        return 'tomato'
+      elif type(node_state) is Noop:
+        return 'white'
+      return viz_colors.setdefault(node.product, (len(viz_colors) % viz_max_colors) + 1)
+
+    def format_type(node):
+      return node.func.__name__ if type(node) is TaskNode else type(node).__name__
+
+    def format_subject(node):
+      if node.variants:
+        return '({})@{}'.format(node.subject,
+                                ','.join('{}={}'.format(k, v) for k, v in node.variants))
+      else:
+        return '({})'.format(node.subject)
+
+    def format_product(node):
+      if type(node) is SelectNode and node.variant_key:
+        return '{}@{}'.format(node.product.__name__, node.variant_key)
+      return node.product.__name__
+
+    def format_node(node, state):
+      return '{}:{}:{} == {}'.format(format_product(node),
+                                     format_subject(node),
+                                     format_type(node),
+                                     str(state).replace('"', '\\"'))
+
+    yield 'digraph plans {'
+    yield '  node[colorscheme={}];'.format(viz_color_scheme)
+    yield '  concentrate=true;'
+    yield '  rankdir=LR;'
+
+    for ((node, node_state), dependency_entries) in self.walk(roots):
+      node_str = format_node(node, node_state)
+
+      yield ' "{}" [style=filled, fillcolor={}];'.format(node_str, format_color(node, node_state))
+
+      for (dep, dep_state) in dependency_entries:
+        yield '  "{}" -> "{}"'.format(node_str, format_node(dep, dep_state))
+
+    yield '}'
 
 
-class ExecutionGraph(object):
-  """A DAG of execution plans where edges represent data dependencies between plans."""
+class ExecutionRequest(datatype('ExecutionRequest', ['roots'])):
+  """Holds the roots for an execution, which might have been requested by a user.
 
-  def __init__(self, root_promises, product_mapper):
-    """
-    :param root_promises: The root promises in the graph; these represent the final products
-                          requested.
-    :type root_promises: :class:`collections.Iterable` of :class:`Promise`
-    :param product_mapper: A registry of all plans in the execution graph that will be used to
-                           traverse from one plan's promises to the plans that will fulfill them
-                           when executed.
-    :type product_mapper: :class:`ProductMapper`
-    """
-    self._root_promises = root_promises
-    self._product_mapper = product_mapper
+  To create an ExecutionRequest, see `LocalScheduler.build_request` (which performs goal
+  translation) or `LocalScheduler.execution_request`.
 
-  @property
-  def root_promises(self):
-    """Return the root promises in the graph.
-
-    These represent the final products requested to satisfy a build request.
-
-    :rtype: :class:`collections.Iterable` of :class:`Promise`
-    """
-    return self._root_promises
-
-  def walk(self):
-    """Performs a depth first post-order walk of the graph of execution plans.
-
-    All plans are visited exactly once.
-
-    :returns: A tuple of the product type the plan will produce when executed and the plan itself.
-    :rtype tuple of (type, :class:`Plan`)
-    """
-    plans = set()
-    for root_promise in self._root_promises:
-      for promise, plan in self._walk_plan(root_promise, plans):
-        yield promise, plan
-
-  def _walk_plan(self, promise, plans):
-    plan = self._product_mapper.promised(promise)
-    if plan not in plans:
-      plans.add(plan)
-      for pr in plan.promises:
-        for pl in self._walk_plan(pr, plans):
-          yield pl
-      yield promise, plan
+  :param roots: Root Nodes for this request.
+  :type roots: list of :class:`pants.engine.exp.nodes.Node`
+  """
 
 
 class Promise(object):
-  """Represents a promise to produce a given product type for a given subject."""
+  """An extremely simple _non-threadsafe_ Promise class."""
 
-  def __init__(self, product_type, subject, configuration=None):
+  def __init__(self):
+    self._success = None
+    self._failure = None
+    self._is_complete = False
+
+  def is_complete(self):
+    return self._is_complete
+
+  def success(self, success):
+    self._success = success
+    self._is_complete = True
+
+  def failure(self, exception):
+    self._failure = exception
+    self._is_complete = True
+
+  def get(self):
+    """Returns the resulting value, or raises the resulting exception."""
+    if not self._is_complete:
+      raise ValueError('{} has not been completed.'.format(self))
+    if self._failure:
+      raise self._failure
+    else:
+      return self._success
+
+
+class NodeBuilder(Closable):
+  """Holds an index of tasks used to instantiate TaskNodes."""
+
+  @classmethod
+  def create(cls, tasks):
+    """Indexes tasks by their output type."""
+    serializable_tasks = defaultdict(set)
+    for output_type, input_selects, task in tasks:
+      serializable_tasks[output_type].add((task, tuple(input_selects)))
+    return cls(serializable_tasks)
+
+  def __init__(self, tasks):
+    self._tasks = tasks
+
+  def gen_nodes(self, subject, product, variants):
+    if FilesystemNode.is_filesystem_pair(type(subject), product):
+      # Native filesystem operations.
+      yield FilesystemNode(subject, product, variants)
+    else:
+      # Tasks.
+      for task, anded_clause in self._tasks[product]:
+        yield TaskNode(subject, product, variants, task, anded_clause)
+
+  def select_node(self, selector, subject, variants):
+    """Constructs a Node for the given Selector and the given Subject/Variants.
+
+    This method is decoupled from Selector classes in order to allow the `selector` package to not
+    need a dependency on the `nodes` package.
     """
-    :param type product_type: The type of product promised.
-    :param subject: The subject the product will be produced for; ie: a java library would be a
-                    natural subject for a request for classfile products.
-    :type subject: :class:`Subject` or else any object that will be the primary of the stored
-                   `Subject`.
-    :param object configuration: An optional promised configuration for the product.
-    """
-    self._product_type = product_type
-    self._subject = Subject.as_subject(subject)
-    self._configuration = configuration
+    selector_type = type(selector)
+    if selector_type is Select:
+      return SelectNode(subject, selector.product, variants, None)
+    elif selector_type is SelectVariant:
+      return SelectNode(subject, selector.product, variants, selector.variant_key)
+    elif selector_type is SelectDependencies:
+      return DependenciesNode(subject, selector.product, variants, selector.deps_product, selector.field)
+    elif selector_type is SelectProjection:
+      return ProjectionNode(subject, selector.product, variants, selector.projected_subject, selector.fields, selector.input_product)
+    elif selector_type is SelectLiteral:
+      # NB: Intentionally ignores subject parameter to provide a literal subject.
+      return SelectNode(selector.subject, selector.product, variants, None)
+    else:
+      raise ValueError('Unrecognized Selector type "{}" for: {}'.format(selector_type, selector))
 
-  @property
-  def product_type(self):
-    """Return the type of product promised.
 
-    :rtype: type
-    """
-    return self._product_type
+class StepRequest(datatype('Step', ['step_id', 'node', 'dependencies', 'project_tree'])):
+  """Additional inputs needed to run Node.step for the given Node.
 
-  @property
-  def subject(self):
-    """Return the subject of this promise.
+  TODO: See docs on StepResult.
 
-    :rtype: :class:`Subject`
-    """
-    return self._subject
+  :param step_id: A unique id for the step, to ease comparison.
+  :param node: The Node instance that will run.
+  :param dependencies: The declared dependencies of the Node from previous Waiting steps.
+  :param project_tree: A FileSystemProjectTree instance.
+  """
 
-  def rebind(self, subject):
-    """Return a version of this promise bound to the new subject.
+  def __call__(self, node_builder):
 
-    :param subject: The new subject of the promise.
-    :type subject: :class:`Subject` or else any object that will be the primary of the stored
-                   `Subject`.
-    :rtype: :class:`Promise`
-    """
-    return Promise(self._product_type, subject, configuration=self._configuration)
-
-  def _key(self):
-    # We promise the product_type for the primary subject, the alternate does not affect
-    # consume-side identity.
-    return self._product_type, self._subject.primary, self._configuration
-
-  def __hash__(self):
-    return hash(self._key())
+    """Called by the Engine in order to execute this Step."""
+    step_context = StepContext(node_builder, self.project_tree)
+    state = self.node.step(self.dependencies, step_context)
+    return (StepResult(state,))
 
   def __eq__(self, other):
-    return isinstance(other, Promise) and self._key() == other._key()
+    return type(self) == type(other) and self.step_id == other.step_id
 
   def __ne__(self, other):
     return not (self == other)
 
-  def __repr__(self):
-    return ('Promise(product_type={!r}, subject={!r}, configuration={!r})'
-            .format(self._product_type, self._subject, self._configuration))
+  def __hash__(self):
+    return hash(self.step_id)
 
 
-class ProductMapper(object):
-  """Stores the mapping from promises to the plans whose execution will satisfy them."""
+class StepResult(datatype('Step', ['state'])):
+  """The result of running a Step, passed back to the Scheduler via the Promise class.
 
-  class InvalidRegistrationError(Exception):
-    """Indicates registration of a plan that does not cover the expected subject."""
+  :param state: The State value returned by the Step.
+  """
 
-  def __init__(self):
-    self._promises = {}
 
-  def register_promises(self, product_type, plan, primary_subject=None, configuration=None):
-    """Registers the promises the given plan will satisfy when executed.
+class LocalScheduler(object):
+  """A scheduler that expands a ProductGraph by executing user defined tasks."""
 
-    :param type product_type: The product type the plan will produce when executed.
-    :param plan: The plan to register promises for.
-    :type plan: :class:`Plan`
-    :param primary_subject: An optional primary subject.  If supplied, the registered promise for
-                            this subject will be returned.
-    :param object configuration: An optional promised configuration.
-    :returns: The promise for the primary subject of one was supplied.
-    :rtype: :class:`Promise`
-    :raises: :class:`ProductMapper.InvalidRegistrationError` if a primary subject was supplied but
-             not a member of the given plan's subjects.
+  def __init__(self, goals, tasks, storage, project_tree, graph_lock=None, graph_validator=None):
     """
-    # Index by all subjects.  This allows dependencies on products from "chunking" tasks, even
-    # products from tasks that act globally in the extreme.
-    primary_promise = None
-    for subject in plan.subjects:
-      promise = Promise(product_type, subject, configuration=configuration)
-      if primary_subject == subject.primary:
-        primary_promise = promise
-      self._promises[promise] = plan
-
-    if primary_subject and not primary_promise:
-      raise self.InvalidRegistrationError('The subject {} is not part of the final plan!: {}'
-                                          .format(primary_subject, plan))
-    return primary_promise
-
-  def promised(self, promise):
-    """Return the plan that was promised.
-
-    :param promise: The promise to lookup a registered plan for.
-    :type promise: :class:`Promise`
-    :returns: The plan registered for the given promise; or `None`.
-    :rtype: :class:`Plan`
+    :param goals: A dict from a goal name to a product type. A goal is just an alias for a
+           particular (possibly synthetic) product.
+    :param tasks: A set of (output, input selection clause, task function) triples which
+           is used to compute values in the product graph.
+    :param project_tree: An instance of ProjectTree for the current build root.
+    :param graph_lock: A re-entrant lock to use for guarding access to the internal ProductGraph
+                       instance. Defaults to creating a new threading.RLock().
     """
-    return self._promises.get(promise)
+    self._products_by_goal = goals
+    self._tasks = tasks
+    self._project_tree = project_tree
+    self._node_builder = NodeBuilder.create(self._tasks)
 
+    self._graph_validator = graph_validator
+    self._product_graph = ProductGraph()
+    self._product_graph_lock = graph_lock or threading.RLock()
+    self._step_id = 0
 
-class LocalScheduler(Scheduler):
-  """A scheduler that formulates an execution graph locally."""
+  def visualize_graph_to_file(self, roots, filename):
+    """Visualize a graph walk by writing graphviz `dot` output to a file.
 
-  def __init__(self, graph, planners):
+    :param iterable roots: An iterable of the root nodes to begin the graph walk from.
+    :param str filename: The filename to output the graphviz output to.
     """
-    :param graph: The BUILD graph build requests will execute against.
-    :type graph: :class:`pants.engine.exp.graph.Graph`
-    :param planners: All the task planners known to the system.
-    :type planners: :class:`Planners`
+    with self._product_graph_lock, open(filename, 'wb') as fh:
+      for line in self.product_graph.visualize(roots):
+        fh.write(line)
+        fh.write('\n')
+
+  def _create_step(self, node):
+    """Creates a Step and Promise with the currently available dependencies of the given Node.
+
+    If the dependencies of a Node are not available, returns None.
+
+    TODO: Content addressing node and its dependencies should only happen if node is cacheable
+      or in a multi-process environment.
     """
-    self._graph = graph
-    self._planners = planners
-    self._product_mapper = ProductMapper()
-    self._plans_by_product_type_by_planner = defaultdict(lambda: defaultdict(OrderedSet))
+    Node.validate_node(node)
 
-  def execution_graph(self, build_request):
-    """Create an execution graph that can satisfy the given build request.
+    # See whether all of the dependencies for the node are available.
+    deps = dict()
+    for dep in self._product_graph.dependencies_of(node):
+      state = self._product_graph.state(dep)
+      if state is None:
+        return None
+      deps[dep] = state
+    # Additionally, include Noops for any dependencies that were cyclic.
+    for dep in self._product_graph.cyclic_dependencies_of(node):
+      noop_state = Noop('Dep from {} to {} would cause a cycle.'.format(node, dep))
+      deps[dep] = noop_state
 
-    :param build_request: The description of the goals to achieve.
-    :type build_request: :class:`BuildRequest`
-    :returns: An execution graph of plans that, when reduced, can satisfy the given build request.
-    :rtype: :class:`ExecutionGraph`
-    :raises: :class:`LocalScheduler.SchedulingError` if no execution graph solution could be found.
+    # Ready.
+    self._step_id += 1
+    return (StepRequest(self._step_id, node, deps, self._project_tree), Promise())
+
+  def node_builder(self):
+    """Return the NodeBuilder instance for this Scheduler.
+
+    A NodeBuilder is a relatively heavyweight object (since it contains an index of all
+    registered tasks), so it should be used for the execution of multiple Steps.
     """
-    goals = build_request.goals
-    subjects = [self._graph.resolve(a) for a in build_request.addressable_roots]
+    return self._node_builder
 
+  def build_request(self, goals, subjects):
+    """Translate the given goal names into product types, and return an ExecutionRequest.
 
-    root_promises = []
-    for goal in goals:
-      # TODO(John Sirois): Allow for subject-less (target-less) goals.  Examples are clean-all,
-      # ng-killall, and buildgen.go.
-      #
-      # 1. If not subjects check for a special Planner subtype with a special subject-less
-      #    promise method.
-      # 2. Use a sentinel NO_SUBJECT, planners that care test for this, other planners that
-      #    looks for Target or Jar or ... will naturally just skip it and no-op.
-      #
-      # Option 1 allows for failing the build if no such subtypes are amongst the goals;
-      # ie: `./pants compile` would fail since there are no inputs and all compile registered
-      # planners require subjects (don't implement the subtype).
-      # Seems promising - but what about mixed goals and no subjects?
-      #
-      # What about if subjects but the planner doesn't care about them?  Is using the IvyGlobal
-      # trick good enough here?  That pattern with fake Plans to aggregate could be packaged in
-      # a TaskPlanner baseclass.
-      product_types = OrderedSet()
-      for planner in self._planners.for_goal(goal):
-        product_types.update(planner.product_types.keys())
+    :param goals: The list of goal names supplied on the command line.
+    :type goals: list of string
+    :param subjects: A list of Spec and/or PathGlobs objects.
+    :type subject: list of :class:`pants.base.specs.Spec`, `pants.build_graph.Address`, and/or
+      :class:`pants.engine.exp.fs.PathGlobs` objects.
+    :returns: An ExecutionRequest for the given goals and subjects.
+    """
+    return self.execution_request([self._products_by_goal[goal_name] for goal_name in goals],
+                                  subjects)
+
+  def execution_request(self, products, subjects):
+    """Create and return an ExecutionRequest for the given products and subjects.
+
+    The resulting ExecutionRequest object will contain keys tied to this scheduler's ProductGraph, and
+    so it will not be directly usable with other scheduler instances without being re-created.
+
+    An ExecutionRequest for an Address represents exactly one product output, as does SingleAddress. But
+    we differentiate between them here in order to normalize the output for all Spec objects
+    as "list of product".
+
+    :param products: A list of product types to request for the roots.
+    :type products: list of types
+    :param subjects: A list of Spec and/or PathGlobs objects.
+    :type subject: list of :class:`pants.base.specs.Spec`, `pants.build_graph.Address`, and/or
+      :class:`pants.engine.exp.fs.PathGlobs` objects.
+    :returns: An ExecutionRequest for the given products and subjects.
+    """
+
+    # Determine the root Nodes for the products and subjects selected by the goals and specs.
+    def roots():
       for subject in subjects:
-        for product_type in self._planners.produced_types_for_subject(subject, product_types):
-          root_promises.append(self.promise(subject, product_type))
+        for product in products:
+          if type(subject) is Address:
+            yield SelectNode(subject, product, None, None)
+          elif type(subject) in [SingleAddress, SiblingAddresses, DescendantAddresses]:
+            yield DependenciesNode(subject, product, None, Addresses, None)
+          elif type(subject) is PathGlobs:
+            yield DependenciesNode(subject, product, None, Paths, None)
+          else:
+            raise ValueError('Unsupported root subject type: {}'.format(subject))
 
-    # Give aggregating planners a chance to aggregate plans.
-    for planner, plans_by_product_type in self._plans_by_product_type_by_planner.items():
-      for product_type, plans in plans_by_product_type.items():
-        finalized_plans = planner.finalize_plans(plans)
-        if finalized_plans is not plans:
-          for finalized_plan in finalized_plans:
-            self._product_mapper.register_promises(product_type, finalized_plan)
+    return ExecutionRequest(tuple(roots()))
 
-    return ExecutionGraph(root_promises, self._product_mapper)
+  @property
+  def product_graph(self):
+    return self._product_graph
 
-  # A synthetic planner that lifts products defined directly on targets into the product
-  # namespace.
-  class NoPlanner(object):
-    @classmethod
-    def finalize_plans(cls, plans):
-      return plans
+  def root_entries(self, execution_request):
+    """Returns the roots for the given ExecutionRequest as a dict from Node to State."""
+    with self._product_graph_lock:
+      return {root: self._product_graph.state(root) for root in execution_request.roots}
 
-  def promise(self, subject, product_type, configuration=None):
-    if isinstance(subject, Address):
-      subject = self._graph.resolve(subject)
+  def _complete_step(self, node, step_result):
+    """Given a StepResult for the given Node, complete the step."""
+    result = step_result.state
+    # Update the Node's state in the graph.
+    self._product_graph.update_state(node, result)
 
-    promise = Promise(product_type, subject, configuration=configuration)
-    plan = self._product_mapper.promised(promise)
-    if plan is not None:
-      return promise
+  def invalidate_files(self, filenames):
+    """Calls `ProductGraph.invalidate_files()` against an internal ProductGraph instance
+    under protection of a scheduler-level lock."""
+    with self._product_graph_lock:
+      return self._product_graph.invalidate_files(filenames)
 
-    plans = []
-    # For all planners that can produce this product with the given configuration, request it.
-    for planner in self._planners.for_product_type_and_subject(product_type,
-                                                               subject,
-                                                               configuration=configuration):
-      plan = planner.plan(self, product_type, subject, configuration=configuration)
-      if plan:
-        plans.append((planner, plan))
-    # Additionally, if the product is directly available as a "native" product on the subject,
-    # include a Plan that lifts it off the subject.
-    for native_product_type in Products.for_subject(subject):
-      if native_product_type == product_type:
-        plans.append((self.NoPlanner, Plan(func_or_task_type=lift_native_product,
-                                       subjects=(subject,),
-                                       subject=subject,
-                                       product_type=product_type)))
+  def schedule(self, execution_request):
+    """Yields batches of Steps until the roots specified by the request have been completed.
 
-    # TODO: It should be legal to have multiple plans, and they should be merged.
-    if len(plans) > 1:
-      planners = [planner for planner, plan in plans]
-      raise ConflictingProducersError(product_type, subject, planners)
-    elif not plans:
-      raise NoProducersError(product_type, subject)
+    This method should be called by exactly one scheduling thread, but the Step objects returned
+    by this method are intended to be executed in multiple threads, and then satisfied by the
+    scheduling thread.
+    """
+    # A dict from Node to a possibly executing Step. Only one Step exists for a Node at a time.
+    outstanding = {}
+    # Nodes that might need to have Steps created (after any outstanding Step returns).
+    candidates = set(execution_request.roots)
 
-    planner, plan = plans[0]
-    try:
-      primary_promise = self._product_mapper.register_promises(product_type, plan,
-                                                               primary_subject=subject,
-                                                               configuration=configuration)
-      self._plans_by_product_type_by_planner[planner][product_type].add(plan)
-      return primary_promise
-    except ProductMapper.InvalidRegistrationError:
-      raise SchedulingError('The plan produced for {subject!r} by {planner!r} does not cover '
-                            '{subject!r}:\n\t{plan!r}'.format(subject=subject,
-                                                              planner=type(planner).__name__,
-                                                              plan=plan))
+    with self._product_graph_lock:
+      # Yield nodes that are ready, and then compute new ones.
+      scheduling_iterations = 0
+      while True:
+        # Create Steps for candidates that are ready to run, and not already running.
+        ready = dict()
+        for candidate_node in list(candidates):
+          if candidate_node in outstanding:
+            # Node is still a candidate, but is currently running.
+            continue
+          if self._product_graph.is_complete(candidate_node):
+            # Node has already completed.
+            candidates.discard(candidate_node)
+            continue
+          # Create a step if all dependencies are available; otherwise, can assume they are
+          # outstanding, and will cause this Node to become a candidate again later.
+          candidate_step = self._create_step(candidate_node)
+          if candidate_step is not None:
+            ready[candidate_node] = candidate_step
+          candidates.discard(candidate_node)
+
+        if not ready and not outstanding:
+          # Finished.
+          break
+        yield ready.values()
+        scheduling_iterations += 1
+        outstanding.update(ready)
+
+        # Finalize completed Steps.
+        for node, entry in outstanding.items()[:]:
+          step, promise = entry
+          if not promise.is_complete():
+            continue
+          # The step has completed; see whether the Node is completed.
+          outstanding.pop(node)
+          self._complete_step(step.node, promise.get())
+          if self._product_graph.is_complete(step.node):
+            # The Node is completed: mark any of its dependents as candidates for Steps.
+            candidates.update(d for d in self._product_graph.dependents_of(step.node))
+          else:
+            # Waiting on dependencies.
+            incomplete_deps = [d for d in self._product_graph.dependencies_of(step.node)
+                               if not self._product_graph.is_complete(d)]
+            if incomplete_deps:
+              # Mark incomplete deps as candidates for Steps.
+              candidates.update(incomplete_deps)
+            else:
+              # All deps are already completed: mark this Node as a candidate for another step.
+              candidates.add(step.node)
+
+      print('executed {} nodes in {} scheduling iterations. '
+            'there have been {} total steps for {} total nodes.'.format(
+              sum(1 for _ in self._product_graph.walk(execution_request.roots)),
+              scheduling_iterations,
+              self._step_id,
+              len(self._product_graph.dependencies())),
+            file=sys.stderr)
+
+      if self._graph_validator is not None:
+        self._graph_validator.validate(self._product_graph)

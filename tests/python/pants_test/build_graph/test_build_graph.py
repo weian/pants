@@ -245,8 +245,7 @@ class BuildGraphTest(BaseTest):
     self.build_graph.inject_address_closure(Address.parse(spec))
 
   def test_invalid_address(self):
-    with self.assertRaisesRegexp(AddressLookupError,
-                                 '^BUILD file does not exist at:.*/BUILD'):
+    with self.assertRaisesRegexp(AddressLookupError, '^.* does not contain any BUILD files.$'):
       self.inject_address_closure('//:a')
 
     self.add_to_build_file('BUILD',
@@ -254,7 +253,7 @@ class BuildGraphTest(BaseTest):
                            '  dependencies=["non-existent-path:b"],'
                            ')')
     with self.assertRaisesRegexp(BuildGraph.TransitiveLookupError,
-                                 '^BUILD file does not exist at:.*/non-existent-path/BUILD'
+                                 '^.*/non-existent-path does not contain any BUILD files.'
                                  '\s+when translating spec non-existent-path:b'
                                  '\s+referenced from //:a$'):
       self.inject_address_closure('//:a')
@@ -269,7 +268,7 @@ class BuildGraphTest(BaseTest):
                            '  dependencies=["non-existent-path:c"],'
                            ')')
     with self.assertRaisesRegexp(BuildGraph.TransitiveLookupError,
-                                 '^BUILD file does not exist at: .*/non-existent-path/BUILD'
+                                 '^.*/non-existent-path does not contain any BUILD files.'
                                  '\s+when translating spec non-existent-path:c'
                                  '\s+referenced from goodpath:b'
                                  '\s+referenced from //:a$'):
@@ -299,7 +298,7 @@ class BuildGraphTest(BaseTest):
                            '  dependencies=["non-existent-path:d"],'
                            ')')
     with self.assertRaisesRegexp(BuildGraph.TransitiveLookupError,
-                                 '^BUILD file does not exist at:.*/non-existent-path/BUILD'
+                                 '^.*/non-existent-path does not contain any BUILD files.'
                                  '\s+when translating spec non-existent-path:d'
                                  '\s+referenced from goodpath:c'
                                  '\s+referenced from goodpath:b'
@@ -321,3 +320,38 @@ class BuildGraphTest(BaseTest):
         '^Addresses in dependencies must be unique. \'other:b\' is referenced more than once.'
         '\s+referenced from //:a$'):
       self.inject_address_closure('//:a')
+
+  def test_leveled_predicate(self):
+    a = self.make_target(spec='a')
+    b = self.make_target(spec='b', dependencies=[a])
+    c = self.make_target(spec='c', dependencies=[b])
+    d = self.make_target(spec='d', dependencies=[a])
+
+    subgraph_funcs = (self.build_graph.transitive_subgraph_of_addresses,
+                      self.build_graph.transitive_subgraph_of_addresses_bfs)
+
+    def check_funcs(expected, roots, **kwargs):
+      for func in subgraph_funcs:
+        self.assertEquals(set(expected), set(func([t.address for t in roots], **kwargs)))
+
+    def only_roots(_, __):
+      # This is a silly constraint, because it effectively turns the transitive subgraph functions
+      # into the identity function.
+      return False
+
+    def only_direct_deps(_, depth):
+      return depth == 0
+
+    def only_indirect_a(target, depth):
+      # This is a really weird constraint just to demonstrate functionality.
+      return target != a or depth > 0
+
+    check_funcs({a, b, d}, {b, d}, leveled_predicate=None)
+    check_funcs({b, d}, {b, d}, leveled_predicate=only_roots)
+    check_funcs({a, b, d}, {b, d}, leveled_predicate=only_direct_deps)
+    check_funcs({d, a}, {d}, leveled_predicate=only_direct_deps)
+    check_funcs({b, c}, {c}, leveled_predicate=only_direct_deps)
+    check_funcs({b, c, d, a}, {c, d}, leveled_predicate=only_direct_deps)
+    check_funcs({b, d}, {b, d}, leveled_predicate=only_indirect_a)
+    check_funcs({a, b, c, d}, {c, d}, leveled_predicate=only_indirect_a)
+    check_funcs({a, b, c}, {c}, leveled_predicate=only_indirect_a)

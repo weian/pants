@@ -11,8 +11,6 @@ from collections import defaultdict
 from pants.backend.jvm.tasks.nailgun_task import NailgunTask
 from pants.base.exceptions import TaskError
 from pants.goal.products import MultipleRootedProducts
-from pants.option.options import Options
-from pants.util.dirutil import safe_mkdir
 
 from pants.contrib.scalajs.subsystems.scala_js_platform import ScalaJSPlatform
 from pants.contrib.scalajs.targets.scala_js_binary import ScalaJSBinary
@@ -26,12 +24,10 @@ class ScalaJSLink(NailgunTask):
   @classmethod
   def register_options(cls, register):
     super(ScalaJSLink, cls).register_options(register)
-    register('--full-opt', default=False, action='store_true', fingerprint=True,
+    register('--full-opt', type=bool, fingerprint=True,
              help='Perform all optimizations; this is generally only useful for deployments.')
-    register('--check-ir', default=False, action='store_true', fingerprint=True,
+    register('--check-ir', type=bool, fingerprint=True,
              help='Perform (relatively costly) validity checks of IR before linking it.')
-    register('--jvm-options', action='append', metavar='<option>...', advanced=True,
-             help='Run with these extra jvm options.')
     # TODO: revisit after https://rbcommons.com/s/twitter/r/3225/
     cls.register_jvm_tool(register, 'scala-js-cli', main=cls._SCALA_JS_CLI_MAIN)
 

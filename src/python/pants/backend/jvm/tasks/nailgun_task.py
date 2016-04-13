@@ -23,11 +23,11 @@ class NailgunTaskBase(JvmToolTaskMixin, TaskBase):
   @classmethod
   def register_options(cls, register):
     super(NailgunTaskBase, cls).register_options(register)
-    register('--use-nailgun', action='store_true', default=True,
+    register('--use-nailgun', type=bool, default=True,
              help='Use nailgun to make repeated invocations of this task quicker.')
-    register('--nailgun-timeout-seconds', advanced=True, default=10,
+    register('--nailgun-timeout-seconds', advanced=True, default=10, type=float,
              help='Timeout (secs) for nailgun startup.')
-    register('--nailgun-connect-attempts', advanced=True, default=5,
+    register('--nailgun-connect-attempts', advanced=True, default=5, type=int,
              help='Max attempts for nailgun connects.')
     cls.register_jvm_tool(register,
                           'nailgun-server',
@@ -42,6 +42,9 @@ class NailgunTaskBase(JvmToolTaskMixin, TaskBase):
     return super(NailgunTaskBase, cls).global_subsystems() + (DistributionLocator,)
 
   def __init__(self, *args, **kwargs):
+    """
+    :API: public
+    """
     super(NailgunTaskBase, self).__init__(*args, **kwargs)
 
     id_tuple = (self.ID_PREFIX, self.__class__.__name__)
@@ -82,6 +85,8 @@ class NailgunTaskBase(JvmToolTaskMixin, TaskBase):
     If --no-use-nailgun is specified then the java main is run in a freshly spawned subprocess,
     otherwise a persistent nailgun server dedicated to this Task subclass is used to speed up
     amortized run times.
+
+    :API: public
     """
     executor = self.create_java_executor()
 
@@ -106,7 +111,11 @@ class NailgunTaskBase(JvmToolTaskMixin, TaskBase):
 
 
 # TODO(John Sirois): This just prevents ripple - maybe inline
-class NailgunTask(NailgunTaskBase, Task): pass
+class NailgunTask(NailgunTaskBase, Task):
+  """
+  :API: public
+  """
+  pass
 
 
 class NailgunKillall(Task):
@@ -115,7 +124,7 @@ class NailgunKillall(Task):
   @classmethod
   def register_options(cls, register):
     super(NailgunKillall, cls).register_options(register)
-    register('--everywhere', default=False, action='store_true',
+    register('--everywhere', type=bool,
              help='Kill all nailguns servers launched by pants for all workspaces on the system.')
 
   def execute(self):

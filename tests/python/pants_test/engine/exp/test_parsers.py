@@ -9,10 +9,9 @@ import json
 import unittest
 from textwrap import dedent
 
-from pants.engine.exp import parsers
+from pants.engine.exp import parser
+from pants.engine.exp.examples import parsers
 from pants.engine.exp.objects import Resolvable
-from pants.engine.exp.parsers import ParseError
-from pants.util.contextutil import temporary_file
 
 
 # A duck-typed Serializable with an `==` suitable for ease of testing.
@@ -30,20 +29,36 @@ class Bob(object):
     return isinstance(other, Bob) and self._key() == other._key()
 
 
-def parse(parser, document, **args):
-  with temporary_file() as fp:
-    fp.write(document)
-    fp.close()
-    return parser(fp.name, **args)
+class EmptyTable(parser.SymbolTable):
+  @classmethod
+  def table(cls):
+    return {}
+
+
+class TestTable(parser.SymbolTable):
+  @classmethod
+  def table(cls):
+    return {'bob': Bob}
+
+
+class TestTable2(parser.SymbolTable):
+  @classmethod
+  def table(cls):
+    return {'nancy': Bob}
+
+
+def parse(parser, document, symbol_table_cls, **args):
+  return parser.parse('/dev/null', document, symbol_table_cls, **args)
 
 
 class JsonParserTest(unittest.TestCase):
-  def parse(self, document, **kwargs):
-    return parse(parsers.parse_json, document, **kwargs)
+  def parse(self, document, symbol_table_cls=None, **kwargs):
+    symbol_table_cls = symbol_table_cls or EmptyTable
+    return parse(parsers.JsonParser, document, symbol_table_cls, **kwargs)
 
-  def round_trip(self, obj, symbol_table=None):
+  def round_trip(self, obj, symbol_table_cls=None):
     document = parsers.encode_json(obj, inline=True)
-    return self.parse(document, symbol_table=symbol_table)
+    return self.parse(document, symbol_table_cls=symbol_table_cls)
 
   def test_comments(self):
     document = dedent("""
@@ -71,7 +86,6 @@ class JsonParserTest(unittest.TestCase):
     self.assertEqual('pants_test.engine.exp.test_parsers.Bob', results[0]._asdict()['type_alias'])
 
   def test_symbol_table(self):
-    symbol_table = {'bob': Bob}
     document = dedent("""
     # An simple example with a single Bob.
     {
@@ -79,10 +93,10 @@ class JsonParserTest(unittest.TestCase):
       "hobbies": [1, 2, 3]
     }
     """)
-    results = self.parse(document, symbol_table=symbol_table)
+    results = self.parse(document, symbol_table_cls=TestTable)
     self.assertEqual(1, len(results))
     self.assertEqual([Bob(hobbies=[1, 2, 3])],
-                     self.round_trip(results[0], symbol_table=symbol_table))
+                     self.round_trip(results[0], symbol_table_cls=TestTable))
     self.assertEqual('bob', results[0]._asdict()['type_alias'])
 
   def test_nested_single(self):
@@ -213,47 +227,45 @@ class JsonParserTest(unittest.TestCase):
       "nine": 1
     }
     """).strip()
-    with temporary_file() as fp:
-      fp.write(document)
-      fp.close()
-      with self.assertRaises(ParseError) as exc:
-        parsers.parse_json(path=fp.name)
+    filepath = '/dev/null'
+    with self.assertRaises(parser.ParseError) as exc:
+      parsers.JsonParser.parse(filepath, document, symbol_table_cls=EmptyTable)
 
-      # Strip trailing whitespace from the message since our expected literal below will have
-      # trailing ws stripped via editors and code reviews calling for it.
-      actual_lines = [line.rstrip() for line in str(exc.exception).splitlines()]
+    # Strip trailing whitespace from the message since our expected literal below will have
+    # trailing ws stripped via editors and code reviews calling for it.
+    actual_lines = [line.rstrip() for line in str(exc.exception).splitlines()]
 
-      # This message from the json stdlib varies between python releases, so fuzz the match a bit.
-      self.assertRegexpMatches(actual_lines[0],
-                               r'Expecting (?:,|\',\'|",") delimiter: line 3 column 12 \(char 71\)')
+    # This message from the json stdlib varies between python releases, so fuzz the match a bit.
+    self.assertRegexpMatches(actual_lines[0],
+                             r'Expecting (?:,|\',\'|",") delimiter: line 3 column 12 \(char 71\)')
 
-      self.assertEqual(dedent("""
-        In document at {path}:
-            # An example with several Bobs.
+    self.assertEqual(dedent("""
+      In document at {filepath}:
+          # An example with several Bobs.
 
-            # One with hobbies.
-              {{
-                "type_alias": "pants_test.engine.exp.test_parsers.Bob",
+          # One with hobbies.
+            {{
+              "type_alias": "pants_test.engine.exp.test_parsers.Bob",
 
-                # And internal comment and blank lines.
+              # And internal comment and blank lines.
 
-                "hobbies": [1, 2, 3]}} {{
-              # This comment is inside an empty object that started on the prior line!
-            }}
+              "hobbies": [1, 2, 3]}} {{
+            # This comment is inside an empty object that started on the prior line!
+          }}
 
-            # Another that is imaginary aged.
-         1: {{
-         2:   "type_alias": "pants_test.engine.exp.test_parsers.Bob",
-         3:   "age": 42i,
+          # Another that is imaginary aged.
+       1: {{
+       2:   "type_alias": "pants_test.engine.exp.test_parsers.Bob",
+       3:   "age": 42i,
 
-         4:   "four": 1,
-         5:   "five": 1,
-         6:   "six": 1,
-         7:   "seven": 1,
-         8:   "eight": 1,
-         9:   "nine": 1
-        10: }}
-        """.format(path=fp.name)).strip(), '\n'.join(actual_lines[1:]))
+       4:   "four": 1,
+       5:   "five": 1,
+       6:   "six": 1,
+       7:   "seven": 1,
+       8:   "eight": 1,
+       9:   "nine": 1
+      10: }}
+      """.format(filepath=filepath)).strip(), '\n'.join(actual_lines[1:]))
 
 
 class JsonEncoderTest(unittest.TestCase):
@@ -315,33 +327,31 @@ class PythonAssignmentsParserTest(unittest.TestCase):
       hobbies=[1, 2, 3]
     )
     """)
-    results = parse(parsers.python_assignments_parser(), document)
+    results = parse(parsers.PythonAssignmentsParser, document, symbol_table_cls=EmptyTable)
     self.assertEqual([Bob(name='nancy', hobbies=[1, 2, 3])], results)
 
     # No symbol table was used so no `type_alias` plumbing can be expected.
     self.assertNotIn('type_alias', results[0]._asdict())
 
   def test_symbol_table(self):
-    symbol_table = {'nancy': Bob}
     document = dedent("""
     bill = nancy(
       hobbies=[1, 2, 3]
     )
     """)
-    results = parse(parsers.python_assignments_parser(symbol_table), document)
+    results = parse(parsers.PythonAssignmentsParser, document, symbol_table_cls=TestTable2)
     self.assertEqual([Bob(name='bill', hobbies=[1, 2, 3])], results)
     self.assertEqual('nancy', results[0]._asdict()['type_alias'])
 
 
 class PythonCallbacksParserTest(unittest.TestCase):
   def test(self):
-    symbol_table = {'nancy': Bob}
     document = dedent("""
     nancy(
       name='bill',
       hobbies=[1, 2, 3]
     )
     """)
-    results = parse(parsers.python_callbacks_parser(symbol_table), document)
+    results = parse(parsers.PythonCallbacksParser, document, symbol_table_cls=TestTable2)
     self.assertEqual([Bob(name='bill', hobbies=[1, 2, 3])], results)
     self.assertEqual('nancy', results[0]._asdict()['type_alias'])

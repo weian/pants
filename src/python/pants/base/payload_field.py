@@ -6,13 +6,11 @@ from __future__ import (absolute_import, division, generators, nested_scopes, pr
                         unicode_literals, with_statement)
 
 import json
-import os
 from abc import abstractmethod
 from hashlib import sha1
 
 from twitter.common.collections import OrderedSet
 
-from pants.base.build_environment import get_buildroot
 from pants.util.meta import AbstractClass
 
 
@@ -21,6 +19,9 @@ def stable_json_dumps(obj):
 
 
 def stable_json_sha1(obj):
+  """
+  :API: public
+  """
   return sha1(stable_json_dumps(obj)).hexdigest()
 
 
@@ -33,7 +34,10 @@ def combine_hashes(hashes):
 
 
 class PayloadField(AbstractClass):
-  """An immutable, hashable structure to be mixed into Payload instances."""
+  """An immutable, hashable structure to be mixed into Payload instances.
+
+  :API: public
+  """
   _fingerprint_memo = None
 
   def fingerprint(self):
@@ -41,6 +45,8 @@ class PayloadField(AbstractClass):
 
     The fingerprint returns either a bytestring or None.  If the return is None, consumers of the
     fingerprint may choose to elide this PayloadField from their combined hash computation.
+
+    :API: public
     """
     if self._fingerprint_memo is None:
       self._fingerprint_memo = self._compute_fingerprint()
@@ -50,6 +56,8 @@ class PayloadField(AbstractClass):
     """Invalidates the memoized fingerprint for this field.
 
     Exposed for testing.
+
+    :API: public
     """
     self._fingerprint_memo = None
 
@@ -60,14 +68,22 @@ class PayloadField(AbstractClass):
 
   @property
   def value(self):
+    """
+    :API: public
+    """
     return self
 
 
 class FingerprintedMixin(object):
-  """Mixin this class to make your class suitable for passing to FingerprintedField."""
+  """Mixin this class to make your class suitable for passing to FingerprintedField.
+
+  :API: public
+  """
 
   def fingerprint(self):
     """Override this method to implement a fingerprint for your class.
+
+    :API: public
 
     :returns: a sha1 hexdigest hashing the contents of this structure."""
     raise NotImplementedError()
@@ -78,6 +94,8 @@ class FingerprintedField(PayloadField):
 
   The caller must ensure that the class properly implements fingerprint()
   to hash the contents of the object.
+
+  :API: public
   """
 
   def __init__(self, value):
@@ -95,12 +113,13 @@ class PythonRequirementsField(frozenset, PayloadField):
   """A frozenset subclass that mixes in PayloadField.
 
   Must be initialized with an iterable of PythonRequirement instances.
+
+  :API: public
   """
 
   def _compute_fingerprint(self):
     def fingerprint_iter():
       for req in self:
-        # TODO(pl): See PythonRequirement note about version_filter
         hash_items = (
           repr(req._requirement),
           req._repository,
@@ -112,32 +131,12 @@ class PythonRequirementsField(frozenset, PayloadField):
     return combine_hashes(fingerprint_iter())
 
 
-def hash_bundle(bundle):
-  hasher = sha1()
-  hasher.update(bundle._rel_path)
-  for abs_path in sorted(bundle.filemap.keys()):
-    buildroot_relative_path = os.path.relpath(abs_path, get_buildroot())
-    hasher.update(buildroot_relative_path)
-    hasher.update(bundle.filemap[abs_path])
-    with open(abs_path, 'rb') as f:
-      hasher.update(f.read())
-  return hasher.hexdigest()
-
-
-class BundleField(tuple, PayloadField):
-  """A tuple subclass that mixes in PayloadField.
-
-  Must be initialized with an iterable of Bundle instances.
-  """
-
-  def _compute_fingerprint(self):
-    return combine_hashes(map(hash_bundle, self))
-
-
 class ExcludesField(OrderedSet, PayloadField):
   """An OrderedSet subclass that mixes in PayloadField.
 
   Must be initialized with an iterable of Excludes instances.
+
+  :API: public
   """
 
   def _compute_fingerprint(self):
@@ -148,6 +147,8 @@ class JarsField(tuple, PayloadField):
   """A tuple subclass that mixes in PayloadField.
 
   Must be initialized with an iterable of JarDependency instances.
+
+  :API: public
   """
 
   def _compute_fingerprint(self):
@@ -158,6 +159,8 @@ class PrimitiveField(PayloadField):
   """A general field for primitive types.
 
   As long as the contents are JSON representable, their hash can be stably inferred.
+
+  :API: public
   """
 
   def __init__(self, underlying=None):

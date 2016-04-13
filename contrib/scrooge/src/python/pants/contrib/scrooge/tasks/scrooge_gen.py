@@ -5,7 +5,6 @@
 from __future__ import (absolute_import, division, generators, nested_scopes, print_function,
                         unicode_literals, with_statement)
 
-import hashlib
 import os
 import re
 import tempfile
@@ -19,14 +18,11 @@ from pants.backend.jvm.targets.scala_library import ScalaLibrary
 from pants.backend.jvm.tasks.nailgun_task import NailgunTask
 from pants.base.exceptions import TargetDefinitionException, TaskError
 from pants.build_graph.address_lookup_error import AddressLookupError
-from pants.option.custom_types import dict_option, list_option
 from pants.util.dirutil import safe_mkdir, safe_open
 from twitter.common.collections import OrderedSet
 
 from pants.contrib.scrooge.tasks.thrift_util import calculate_compile_sources
 
-
-_CONFIG_SECTION = 'scrooge-gen'
 
 _TARGET_TYPE_FOR_LANG = dict(scala=ScalaLibrary, java=JavaLibrary, android=JavaLibrary)
 
@@ -39,15 +35,13 @@ class ScroogeGen(SimpleCodegenTask, NailgunTask):
   @classmethod
   def register_options(cls, register):
     super(ScroogeGen, cls).register_options(register)
-    register('--verbose', default=False, action='store_true', help='Emit verbose output.')
-    register('--strict', fingerprint=True, default=False, action='store_true',
+    register('--verbose', type=bool, help='Emit verbose output.')
+    register('--strict', fingerprint=True, type=bool,
              help='Enable strict compilation.')
-    register('--jvm-options', default=[], advanced=True, type=list_option,
-             help='Use these jvm options when running Scrooge.')
-    register('--service-deps', default={}, advanced=True, type=dict_option,
+    register('--service-deps', default={}, advanced=True, type=dict,
              help='A map of language to targets to add as dependencies of '
                   'synthetic thrift libraries that contain services.')
-    register('--structs-deps', default={}, advanced=True, type=dict_option,
+    register('--structs-deps', default={}, advanced=True, type=dict,
              help='A map of language to targets to add as dependencies of '
                   'synthetic thrift libraries that contain structs.')
     cls.register_jvm_tool(register, 'scrooge-gen')
@@ -64,10 +58,6 @@ class ScroogeGen(SimpleCodegenTask, NailgunTask):
     super(ScroogeGen, self).__init__(*args, **kwargs)
     self._thrift_defaults = ThriftDefaults.global_instance()
     self._depinfo = None
-
-  @property
-  def config_section(self):
-    return _CONFIG_SECTION
 
   # TODO(benjy): Use regular os-located tmpfiles, as we do everywhere else.
   def _tempname(self):
@@ -88,12 +78,7 @@ class ScroogeGen(SimpleCodegenTask, NailgunTask):
         try:
           dependencies.update(self.context.resolve(depspec))
         except AddressLookupError as e:
-          raise AddressLookupError('{message}\n  referenced from [{section}] key: '
-                                   'gen->deps->{category} in pants.ini'.format(
-                                      message=e,
-                                      section=_CONFIG_SECTION,
-                                      category=category
-                                    ))
+          raise AddressLookupError('{}\n  referenced from {} scope'.format(e, self.options_scope))
     return deps
 
   def execute_codegen(self, target, target_workdir):
@@ -233,3 +218,7 @@ class ScroogeGen(SimpleCodegenTask, NailgunTask):
                       else self._depinfo.structs[language])
     deps.update(target.dependencies)
     return deps
+
+  @property
+  def _copy_target_attributes(self):
+    return ['provides']

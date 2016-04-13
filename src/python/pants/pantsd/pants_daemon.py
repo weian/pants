@@ -16,7 +16,6 @@ from pants.goal.goal import Goal
 from pants.goal.run_tracker import RunTracker
 from pants.logging.setup import setup_logging
 from pants.pantsd.process_manager import ProcessManager
-from pants.subsystem.subsystem import Subsystem
 
 
 class _StreamLogger(object):
@@ -128,11 +127,13 @@ class PantsDaemon(ProcessManager):
     # Reset RunTracker state.
     RunTracker.global_instance().reset(reset_options=False)
 
-    # Reset Subsystem options.
-    Subsystem.set_options(None)
-
     # Reset Goals and Tasks.
     Goal.clear()
+
+  def _setup_services(self, services):
+    for service in services:
+      self._logger.info('setting up service {}'.format(service))
+      service.setup()
 
   def _run_services(self, services):
     """Service runner main loop."""
@@ -182,6 +183,7 @@ class PantsDaemon(ProcessManager):
     self._write_named_sockets(self._socket_map)
 
     # Enter the main service runner loop.
+    self._setup_services(self._services)
     self._run_services(self._services)
 
   def pre_fork(self):

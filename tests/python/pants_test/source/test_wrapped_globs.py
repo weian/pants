@@ -25,8 +25,8 @@ class FilesetRelPathWrapperTest(BaseTest):
         'java_library': JavaLibrary,
       },
       context_aware_object_factories={
-        'globs': Globs.factory,
-        'rglobs': RGlobs.factory,
+        'globs': Globs,
+        'rglobs': RGlobs,
       },
     )
 
@@ -59,6 +59,10 @@ class FilesetRelPathWrapperTest(BaseTest):
     self._spec_test('globs("*.java", exclude=["fleem.java"])',
                     {'globs': ['y/*.java'],
                      'exclude': [{'globs': ['y/fleem.java']}]})
+
+  def test_glob_mid_single(self):
+    self._spec_test('globs("a/*/Fleem.java")',
+                    {'globs': ['y/a/*/Fleem.java']})
 
   def test_glob_to_spec_list(self):
     self._spec_test('["fleem.java", "morx.java"]',
@@ -120,6 +124,14 @@ class FilesetRelPathWrapperTest(BaseTest):
       java_library(name="y", sources=globs("*.java", exclude=["fleem.java"]))
       """))
     self.context().scan()
+
+  def test_glob_with_folder_with_only_folders(self):
+    self.add_to_build_file('z/BUILD', dedent("""
+      java_library(name="z", sources=globs("*", exclude=["BUILD"]))
+      """))
+    graph = self.context().scan()
+    self.assertEqual([],
+                     list(graph.get_target_from_spec('z').sources_relative_to_source_root()))
 
   def test_glob_exclude_doesnt_modify_exclude_array(self):
     self.add_to_build_file('y/BUILD', dedent("""

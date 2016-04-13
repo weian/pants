@@ -8,13 +8,16 @@ from __future__ import (absolute_import, division, generators, nested_scopes, pr
 import os
 
 from pants.base.build_environment import get_buildroot, pants_version
-from pants.base.source_root import SourceRoot
 from pants.build_graph.build_file_aliases import BuildFileAliases
 from pants.build_graph.from_target import FromTarget
+from pants.build_graph.intransitive_dependency import (IntransitiveDependencyFactory,
+                                                       ProvidedDependencyFactory)
 from pants.build_graph.prep_command import PrepCommand
 from pants.build_graph.resources import Resources
 from pants.build_graph.target import Target
+from pants.build_graph.target_scopes import ScopedDependencyFactory
 from pants.source.wrapped_globs import Globs, RGlobs, ZGlobs
+from pants.util.netrc import Netrc
 
 
 """Register the elementary BUILD file constructs."""
@@ -40,14 +43,17 @@ def build_file_aliases():
     },
     objects={
       'get_buildroot': get_buildroot,
+      'netrc': Netrc,
       'pants_version': pants_version,
     },
     context_aware_object_factories={
       'buildfile_path': BuildFilePath,
-      'globs': Globs.factory,
       'from_target': FromTarget,
-      'rglobs': RGlobs.factory,
-      'source_root': SourceRoot.factory,
-      'zglobs': ZGlobs.factory,
+      'globs': Globs,
+      'intransitive': IntransitiveDependencyFactory,
+      'provided': ProvidedDependencyFactory,
+      'rglobs': RGlobs,
+      'scoped': ScopedDependencyFactory,
+      'zglobs': ZGlobs,
     }
   )

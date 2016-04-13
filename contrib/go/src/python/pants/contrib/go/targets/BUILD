@@ -5,6 +5,7 @@ target(
     ':go_library',
     ':go_local_source',
     ':go_remote_library',
+    ':go_thrift_library',
   ]
 )
 
@@ -30,6 +31,7 @@ python_library(
   dependencies=[
     ':go_target',
     'src/python/pants/base:build_environment',
+    'src/python/pants/base:parse_context',
     'src/python/pants/base:payload',
     'src/python/pants/source',
   ],
@@ -51,5 +53,16 @@ python_library(
   sources=['go_target.py'],
   dependencies=[
     'src/python/pants/build_graph'
+  ]
+)
+
+python_library(
+  name='go_thrift_library',
+  sources=['go_thrift_library.py'],
+  dependencies=[
+    ':go_local_source',
+    'src/python/pants/base:parse_context',
+    'src/python/pants/base:payload',
+    'src/python/pants/build_graph',
   ]
 )

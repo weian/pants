@@ -6,9 +6,8 @@ from __future__ import (absolute_import, division, generators, nested_scopes, pr
                         unicode_literals, with_statement)
 
 from abc import abstractmethod
-from textwrap import dedent
+from threading import Timer
 
-from pants.base.deprecated import deprecated_conditional
 from pants.base.exceptions import TestFailedTaskError
 from pants.util.timeout import Timeout, TimeoutReached
 
@@ -20,15 +19,11 @@ class TestRunnerTaskMixin(object):
   expressed can support both languages, and any additional languages that are added to pants.
   """
 
-  @staticmethod
-  def _timeout_for_target(target):
-    return getattr(target, 'timeout', None)
-
   @classmethod
   def register_options(cls, register):
     super(TestRunnerTaskMixin, cls).register_options(register)
-    register('--skip', action='store_true', help='Skip running tests.')
-    register('--timeouts', action='store_true', default=True,
+    register('--skip', type=bool, help='Skip running tests.')
+    register('--timeouts', type=bool, default=True,
              help='Enable test target timeouts. If timeouts are enabled then tests with a timeout= parameter '
              'set on their target will time out after the given number of seconds if not completed. '
              'If no timeout is set, then either the default timeout is used or no timeout is configured. '
@@ -36,10 +31,12 @@ class TestRunnerTaskMixin(object):
              'all tests are run with the total timeout covering the entire run of tests. If a single target '
              'in a test run has no timeout and there is no default, the entire run will have no timeout. This '
              'should change in the future to provide more granularity.')
-    register('--timeout-default', action='store', type=int, advanced=True,
+    register('--timeout-default', type=int, advanced=True,
              help='The default timeout (in seconds) for a test if timeout is not set on the target.')
-    register('--timeout-maximum', action='store', type=int, advanced=True,
+    register('--timeout-maximum', type=int, advanced=True,
              help='The maximum timeout (in seconds) that can be set on a test target.')
+    register('--timeout-terminate-wait', type=int, advanced=True, default=10,
+             help='If a test does not terminate on a SIGTERM, how long to wait (in seconds) before sending a SIGKILL.')
 
   def execute(self):
     """Run the task."""
@@ -71,13 +68,32 @@ class TestRunnerTaskMixin(object):
 
     process_handler = self._spawn(*args, **kwargs)
 
-    # TODO(sbrenn): We use process_handler.kill here because we want to aggressively terminate the
-    # process. It may make sense in the future to do a multi-stage approach
-    # where first we do process_handler.terminate to let it die gracefully, and
-    # then do process_handler.kill if that doesn't work. It will probably require
-    # adding poll() support to ProcessHandler.
+    def _graceful_terminate(handler, wait_time):
+      """
+      Returns a function which attempts to terminate the process gracefully.
+
+      If terminate doesn't work after wait_time seconds, do a kill.
+      """
+
+      def terminator():
+        handler.terminate()
+        def kill_if_not_terminated():
+          if handler.poll() is None:
+            # We can't use the context logger because it might not exist.
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warn("Timed out test did not terminate gracefully after %s seconds, killing..." % wait_time)
+            handler.kill()
+
+        timer = Timer(wait_time, kill_if_not_terminated)
+        timer.start()
+
+      return terminator
+
     try:
-      with Timeout(timeout, abort_handler=process_handler.kill):
+      with Timeout(timeout,
+                   threading_timer=Timer,
+                   abort_handler=_graceful_terminate(process_handler, self.get_options().timeout_terminate_wait)):
         return process_handler.wait()
     except TimeoutReached as e:
       raise TestFailedTaskError(str(e), failed_targets=test_targets)

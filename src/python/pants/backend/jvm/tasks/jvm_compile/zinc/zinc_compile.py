@@ -26,7 +26,6 @@ from pants.base.exceptions import TaskError
 from pants.base.hash_utils import hash_file
 from pants.base.workunit import WorkUnitLabel
 from pants.java.distribution.distribution import DistributionLocator
-from pants.option.custom_types import dict_option
 from pants.util.contextutil import open_zip
 from pants.util.dirutil import safe_open
 from pants.util.memo import memoized_property
@@ -85,16 +84,30 @@ class BaseZincCompile(JvmCompile):
     return (AnnotationProcessor, ScalacPlugin)
 
   @classmethod
+  def get_jvm_options_default(cls, bootstrap_option_values):
+    return ('-Dfile.encoding=UTF-8', '-Dzinc.analysis.cache.limit=1000',
+            '-Djava.awt.headless=true', '-Xmx2g')
+
+  @classmethod
   def get_args_default(cls, bootstrap_option_values):
-    return ('-S-encoding', '-SUTF-8', '-S-g:vars')
+    return ('-C-encoding', '-CUTF-8', '-S-encoding', '-SUTF-8', '-S-g:vars')
 
   @classmethod
   def get_warning_args_default(cls):
-    return ('-S-deprecation', '-S-unchecked')
+    return ('-C-deprecation', '-C-Xlint:all', '-C-Xlint:-serial', '-C-Xlint:-path',
+            '-S-deprecation', '-S-unchecked', '-S-Xlint')
 
   @classmethod
   def get_no_warning_args_default(cls):
-    return ('-S-nowarn',)
+    return ('-C-nowarn', '-C-Xlint:none', '-S-nowarn', '-S-Xlint:none', )
+
+  @classmethod
+  def get_fatal_warnings_enabled_args_default(cls):
+    return ('-S-Xfatal-warnings', '-C-Werror')
+
+  @classmethod
+  def get_fatal_warnings_disabled_args_default(cls):
+    return ()
 
   @classmethod
   def register_options(cls, register):
@@ -102,9 +115,9 @@ class BaseZincCompile(JvmCompile):
     # TODO: disable by default because it breaks dependency parsing:
     #   https://github.com/pantsbuild/pants/issues/2224
     # ...also, as of sbt 0.13.9, it is significantly slower for cold builds.
-    register('--name-hashing', advanced=True, action='store_true', default=False, fingerprint=True,
+    register('--name-hashing', advanced=True, type=bool, fingerprint=True,
              help='Use zinc name hashing.')
-    register('--whitelisted-args', advanced=True, type=dict_option,
+    register('--whitelisted-args', advanced=True, type=dict,
              default={
                '-S.*': False,
                '-C.*': False,
@@ -115,7 +128,7 @@ class BaseZincCompile(JvmCompile):
                   'Options not listed here are subject to change/removal. The value of the dict '
                   'indicates that an option accepts an argument.')
 
-    register('--incremental', advanced=True, action='store_true', default=True,
+    register('--incremental', advanced=True, type=bool, default=True,
              help='When set, zinc will use sub-target incremental compilation, which dramatically '
                   'improves compile performance while changing large targets. When unset, '
                   'changed targets will be compiled with an empty output directory, as if after '
@@ -124,7 +137,7 @@ class BaseZincCompile(JvmCompile):
     # TODO: Defaulting to false due to a few upstream issues for which we haven't pulled down fixes:
     #  https://github.com/sbt/sbt/pull/2085
     #  https://github.com/sbt/sbt/pull/2160
-    register('--incremental-caching', advanced=True, action='store_true', default=False,
+    register('--incremental-caching', advanced=True, type=bool,
              help='When set, the results of incremental compiles will be written to the cache. '
                   'This is unset by default, because it is generally a good precaution to cache '
                   'only clean/cold builds.')
@@ -192,7 +205,8 @@ class BaseZincCompile(JvmCompile):
     self._processor_info_dir = os.path.join(self.workdir, 'apt-processor-info')
 
     # Validate zinc options.
-    ZincCompile.validate_arguments(self.context.log, self.get_options().whitelisted_args, self._args)
+    ZincCompile.validate_arguments(self.context.log, self.get_options().whitelisted_args,
+                                   self._args)
     # A directory independent of any other classpath which can contain per-target
     # plugin resource files.
     self._plugin_info_dir = os.path.join(self.workdir, 'scalac-plugin-info')
@@ -297,7 +311,9 @@ class BaseZincCompile(JvmCompile):
     zinc_args.extend(settings.args)
 
     if fatal_warnings:
-      zinc_args.extend(['-S-Xfatal-warnings', '-C-Werror'])
+      zinc_args.extend(self.get_options().fatal_warnings_enabled_args)
+    else:
+      zinc_args.extend(self.get_options().fatal_warnings_disabled_args)
 
     jvm_options = list(self._jvm_options)
 
@@ -340,9 +356,9 @@ class ZincCompile(BaseZincCompile):
   @classmethod
   def register_options(cls, register):
     super(ZincCompile, cls).register_options(register)
-    register('--scalac-plugins', advanced=True, action='append', fingerprint=True,
+    register('--scalac-plugins', advanced=True, type=list, fingerprint=True,
              help='Use these scalac plugins.')
-    register('--scalac-plugin-args', advanced=True, type=dict_option, default={}, fingerprint=True,
+    register('--scalac-plugin-args', advanced=True, type=dict, default={}, fingerprint=True,
              help='Map from plugin name to list of arguments for that plugin.')
 
     # By default we expect no plugin-jars classpath_spec is filled in by the user, so we accept an

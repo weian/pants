@@ -30,6 +30,9 @@ class JunitRunIntegrationTest(PantsRunIntegrationTest):
     spec = 'testprojects/tests/java/org/pantsbuild/testproject/testjvms:{}'.format(spec_name)
     self.assert_success(self.run_pants(['clean-all', 'test.junit', '--strict-jvm-version', spec]))
 
+  # See https://github.com/pantsbuild/pants/issues/2894 for details on why this is
+  # marked xfail.
+  @expectedFailure
   @skipIf(missing_jvm('1.8'), 'no java 1.8 installation on testing machine')
   def test_java_eight(self):
     self._testjvms('eight')
@@ -97,3 +100,17 @@ class JunitRunIntegrationTest(PantsRunIntegrationTest):
     test_spec = 'testprojects/tests/java/org/pantsbuild/testproject/cucumber'
     with self.pants_results(['clean-all', 'test.junit', '--per-test-timer', test_spec]) as results:
       self.assert_success(results)
+
+  def test_disable_synthetic_jar(self):
+    output = self.run_pants(
+      ['test.junit',
+       '--output-mode=ALL',
+       'testprojects/tests/java/org/pantsbuild/testproject/syntheticjar:test']).stdout_data
+    self.assertIn('Synthetic jar run is detected', output)
+
+    output = self.run_pants(
+      ['test.junit',
+        '--output-mode=ALL',
+       '--no-jvm-synthetic-classpath',
+       'testprojects/tests/java/org/pantsbuild/testproject/syntheticjar:test']).stdout_data
+    self.assertIn('Synthetic jar run is not detected', output)

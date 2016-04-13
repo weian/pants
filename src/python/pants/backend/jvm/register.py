@@ -10,11 +10,12 @@ from pants.backend.jvm.ossrh_publication_metadata import (Developer, License,
                                                           OSSRHPublicationMetadata, Scm)
 from pants.backend.jvm.repository import Repository as repo
 from pants.backend.jvm.scala_artifact import ScalaArtifact
+from pants.backend.jvm.subsystems.jar_dependency_management import JarDependencyManagementSetup
 from pants.backend.jvm.subsystems.scala_platform import ScalaPlatform
 from pants.backend.jvm.subsystems.shader import Shading
 from pants.backend.jvm.targets.annotation_processor import AnnotationProcessor
 from pants.backend.jvm.targets.benchmark import Benchmark
-from pants.backend.jvm.targets.credentials import Credentials
+from pants.backend.jvm.targets.credentials import LiteralCredentials, NetrcCredentials
 from pants.backend.jvm.targets.exclude import Exclude
 from pants.backend.jvm.targets.jar_dependency import JarDependency
 from pants.backend.jvm.targets.jar_library import JarLibrary
@@ -24,6 +25,8 @@ from pants.backend.jvm.targets.java_tests import JavaTests
 from pants.backend.jvm.targets.jvm_app import Bundle, DirectoryReMapper, JvmApp
 from pants.backend.jvm.targets.jvm_binary import Duplicate, JarRules, JvmBinary, Skip
 from pants.backend.jvm.targets.jvm_prep_command import JvmPrepCommand
+from pants.backend.jvm.targets.managed_jar_dependencies import (ManagedJarDependencies,
+                                                                ManagedJarLibraries)
 from pants.backend.jvm.targets.scala_jar_dependency import ScalaJarDependency
 from pants.backend.jvm.targets.scala_library import ScalaLibrary
 from pants.backend.jvm.targets.scalac_plugin import ScalacPlugin
@@ -65,9 +68,8 @@ def build_file_aliases():
     targets={
       'annotation_processor': AnnotationProcessor,
       'benchmark': Benchmark,
-      'credentials': Credentials,
+      'credentials': LiteralCredentials,
       'jar_library': JarLibrary,
-      'unpacked_jars': UnpackedJars,
       'java_agent': JavaAgent,
       'java_library': JavaLibrary,
       'java_tests': JavaTests,
@@ -75,8 +77,11 @@ def build_file_aliases():
       'jvm_app': JvmApp,
       'jvm_binary': JvmBinary,
       'jvm_prep_command' : JvmPrepCommand,
+      'managed_jar_dependencies' : ManagedJarDependencies,
+      'netrc_credentials': NetrcCredentials,
       'scala_library': ScalaLibrary,
       'scalac_plugin': ScalacPlugin,
+      'unpacked_jars': UnpackedJars,
     },
     objects={
       'artifact': Artifact,
@@ -94,13 +99,18 @@ def build_file_aliases():
       'jar_rules': JarRules,
       'repository': repo,
       'Skip': Skip,
-      'shading_relocate': Shading.Relocate.new,
-      'shading_exclude': Shading.Exclude.new,
-      'shading_relocate_package': Shading.RelocatePackage.new,
-      'shading_exclude_package': Shading.ExcludePackage.new,
+      'shading_relocate': Shading.create_relocate,
+      'shading_exclude': Shading.create_exclude,
+      'shading_keep': Shading.create_keep,
+      'shading_zap': Shading.create_zap,
+      'shading_relocate_package': Shading.create_relocate_package,
+      'shading_exclude_package': Shading.create_exclude_package,
+      'shading_keep_package': Shading.create_keep_package,
+      'shading_zap_package': Shading.create_zap_package,
     },
     context_aware_object_factories={
-      'bundle': Bundle.factory,
+      'bundle': Bundle,
+      'managed_jar_libraries': ManagedJarLibraries,
     }
   )
 
@@ -117,6 +127,8 @@ def register_goals():
   Goal.by_name('invalidate').install(ng_killall, first=True)
   Goal.by_name('clean-all').install(ng_killall, first=True)
 
+  task(name='jar-dependency-management', action=JarDependencyManagementSetup).install('bootstrap')
+
   task(name='jvm-platform-explain', action=JvmPlatformExplain).install('jvm-platform-explain')
   task(name='jvm-platform-validate', action=JvmPlatformValidate).install('jvm-platform-validate')
 
@@ -126,7 +138,7 @@ def register_goals():
   task(name='zinc', action=ZincCompile).install('compile')
 
   # Dependency resolution.
-  task(name='ivy', action=IvyResolve).install('resolve')
+  task(name='ivy', action=IvyResolve).install('resolve', first=True)
   task(name='ivy-imports', action=IvyImports).install('imports')
   task(name='unpack-jars', action=UnpackJars).install()
 

@@ -5,54 +5,123 @@
 from __future__ import (absolute_import, division, generators, nested_scopes, print_function,
                         unicode_literals, with_statement)
 
-import os
+import sys
+from contextlib import contextmanager
 
 from pants.base.build_environment import get_buildroot
-from pants.base.parse_context import ParseContext
+from pants.base.cmd_line_spec_parser import CmdLineSpecParser
+from pants.base.file_system_project_tree import FileSystemProjectTree
 from pants.bin.goal_runner import OptionsInitializer
-from pants.engine.exp.legacy.parsers import legacy_python_callbacks_parser
+from pants.engine.exp.engine import LocalSerialEngine
+from pants.engine.exp.fs import create_fs_tasks
+from pants.engine.exp.graph import create_graph_tasks
+from pants.engine.exp.legacy.graph import ExpGraph, create_legacy_graph_tasks
+from pants.engine.exp.legacy.parser import LegacyPythonCallbacksParser, TargetAdaptor
 from pants.engine.exp.mapper import AddressMapper
-from pants.engine.exp.targets import Target
+from pants.engine.exp.nodes import FilesystemNode
+from pants.engine.exp.parser import SymbolTable
+from pants.engine.exp.scheduler import LocalScheduler
+from pants.engine.exp.storage import Storage
+from pants.option.options_bootstrapper import OptionsBootstrapper
+from pants.pantsd.subsystem.pants_daemon_launcher import PantsDaemonLauncher
+from pants.util.memo import memoized_method
 
 
-def list():
-  """Lists all addresses under the current build root subject to `--spec-excludes` constraints."""
+class LegacyTable(SymbolTable):
+  @classmethod
+  @memoized_method
+  def aliases(cls):
+    """TODO: This is a nasty escape hatch to pass aliases to LegacyPythonCallbacksParser."""
+    _, build_config = OptionsInitializer(OptionsBootstrapper()).setup()
+    return build_config.registered_aliases()
+
+  @classmethod
+  @memoized_method
+  def table(cls):
+    return {alias: TargetAdaptor for alias in cls.aliases().target_types}
+
+
+def setup(options=None):
+  if not options:
+    options, _ = OptionsInitializer(OptionsBootstrapper()).setup()
   build_root = get_buildroot()
+  cmd_line_spec_parser = CmdLineSpecParser(build_root)
+  spec_roots = [cmd_line_spec_parser.parse_spec(spec) for spec in options.target_specs]
 
-  options, build_config = OptionsInitializer().setup()
-  aliases = build_config.registered_aliases()
+  storage = Storage.create(debug=False)
+  project_tree = FileSystemProjectTree(build_root)
+  symbol_table_cls = LegacyTable
 
-  symbol_table = {alias: Target for alias in aliases.target_types}
+  # Register "literal" subjects required for these tasks.
+  # TODO: Replace with `Subsystems`.
+  address_mapper = AddressMapper(symbol_table_cls=symbol_table_cls,
+                                 parser_cls=LegacyPythonCallbacksParser)
 
-  object_table = aliases.objects
+  # Create a Scheduler containing graph and filesystem tasks, with no installed goals. The ExpGraph
+  # will explicitly request the products it needs.
+  tasks = (
+    create_legacy_graph_tasks() +
+    create_fs_tasks() +
+    create_graph_tasks(address_mapper, symbol_table_cls)
+  )
 
-  def per_path_symbol_factory(path, global_symbols):
-    per_path_symbols = {}
+  return (
+    LocalScheduler(dict(), tasks, storage, project_tree),
+    storage,
+    options,
+    spec_roots,
+    symbol_table_cls
+  )
 
-    symbols = global_symbols.copy()
-    for alias, target_macro_factory in aliases.target_macro_factories.items():
-      for target_type in target_macro_factory.target_types:
-        symbols[target_type] = lambda *args, **kwargs: per_path_symbols[alias](*args, **kwargs)
 
-    parse_context = ParseContext(rel_path=os.path.relpath(os.path.dirname(path), build_root),
-                                 type_aliases=symbols)
+def maybe_launch_pantsd(options, scheduler):
+  if options.for_global_scope().enable_pantsd is True:
+    pantsd_launcher = PantsDaemonLauncher.global_instance()
+    pantsd_launcher.set_scheduler(scheduler)
+    pantsd_launcher.maybe_launch()
 
-    for alias, object_factory in aliases.context_aware_object_factories.items():
-      per_path_symbols[alias] = object_factory(parse_context)
 
-    for alias, target_macro_factory in aliases.target_macro_factories.items():
-      target_macro = target_macro_factory.target_macro(parse_context)
-      per_path_symbols[alias] = target_macro
-      for target_type in target_macro_factory.target_types:
-        per_path_symbols[target_type] = target_macro
+@contextmanager
+def _open_scheduler(*args, **kwargs):
+  scheduler, storage, options, spec_roots, symbol_table_cls = setup(*args, **kwargs)
 
-    return per_path_symbols
+  engine = LocalSerialEngine(scheduler, storage)
+  engine.start()
+  try:
+    yield scheduler, engine, symbol_table_cls, spec_roots
+    maybe_launch_pantsd(options, scheduler)
+  finally:
+    print('Cache stats: {}'.format(engine._cache.get_stats()), file=sys.stderr)
+    engine.close()
 
-  parser = legacy_python_callbacks_parser(symbol_table,
-                                          object_table=object_table,
-                                          per_path_symbol_factory=per_path_symbol_factory)
-  mapper = AddressMapper(build_root, parser=parser)
 
-  spec_excludes = options.for_global_scope().spec_excludes
-  for address, obj in mapper.walk_addressables(path_excludes=spec_excludes):
-    print(address.spec)
+@contextmanager
+def open_exp_graph(*args, **kwargs):
+  with _open_scheduler(*args, **kwargs) as (scheduler, engine, symbol_table_cls, spec_roots):
+    graph = ExpGraph(scheduler, engine, symbol_table_cls)
+    addresses = tuple(graph.inject_specs_closure(spec_roots))
+    yield graph, addresses, scheduler
+
+
+def dependencies():
+  """Lists the transitive dependencies of targets under the current build root."""
+  with open_exp_graph() as (_, addresses, _):
+    for address in addresses:
+      print(address)
+
+
+def filemap():
+  """Lists the transitive dependencies of targets under the current build root."""
+  with open_exp_graph() as (graph, addresses, _):
+    for address in addresses:
+      target = graph.get_target(address)
+      for source in target.sources_relative_to_buildroot():
+        print('{} {}'.format(source, target.address.spec))
+
+
+def fsnodes():
+  """Prints out all of the FilesystemNodes in the Scheduler for debugging purposes."""
+  with open_exp_graph() as (_, _, scheduler):
+    for node in scheduler.product_graph.completed_nodes():
+      if type(node) is FilesystemNode:
+        print(node)

@@ -10,7 +10,18 @@ from pants.task.task import TaskBase
 
 
 class JvmToolTaskMixin(JvmToolMixin, TaskBase):
-  """A JvmToolMixin specialized for mixing in to Tasks."""
+  """A JvmToolMixin specialized for mixing in to Tasks.
+
+  Tasks that mix this in are those that run code in a JVM as an implementation detail of
+  their operation. Examples are compile.java, checkstyle etc.  This is distinct from tasks
+  whose explicit purpose is to run code in a JVM, such as test.junit or jvm.run.  Those
+  tasks extend `pants.backend.jvm.tasks.JvmTask`.
+
+  Note that this mixin is typically used by extending `pants.backend.jvm.tasks.NailgunTask`
+  rather than being mixed in directly.
+
+  :API: public
+  """
 
   @classmethod
   def prepare(cls, options, round_manager):
@@ -32,6 +43,8 @@ class JvmToolTaskMixin(JvmToolMixin, TaskBase):
 
   def tool_classpath(self, key, scope=None):
     """Get a classpath for the tool previously registered under key in the given scope.
+
+    :API: public
 
     :param string key: The key the tool configuration was registered under.
     :param string scope: The scope the tool configuration was registered under; the task scope by

@@ -6,178 +6,267 @@ from __future__ import (absolute_import, division, generators, nested_scopes, pr
                         unicode_literals, with_statement)
 
 import collections
+from os.path import basename as os_path_basename
 
 import six
 
+from pants.base.specs import DescendantAddresses, SiblingAddresses, SingleAddress
 from pants.build_graph.address import Address
-from pants.engine.exp.addressable import (AddressableDescriptor, TypeConstraintError,
-                                          strip_config_selector)
-from pants.engine.exp.mapper import MappingError
-from pants.engine.exp.objects import Resolvable, Serializable, SerializableFactory, Validatable
-
-
-class ResolveError(Exception):
-  """Indicates an error resolving an address to an object."""
-
-
-class CycleError(ResolveError):
-  """Indicates a cycle was detected during object resolution."""
+from pants.engine.exp.addressable import AddressableDescriptor, Addresses, TypeConstraintError
+from pants.engine.exp.fs import DirectoryListing, FilesContent, Path, Paths, RecursiveSubDirectories
+from pants.engine.exp.mapper import AddressFamily, AddressMap, AddressMapper, ResolveError
+from pants.engine.exp.objects import Locatable, SerializableFactory, Validatable
+from pants.engine.exp.selectors import Select, SelectDependencies, SelectLiteral, SelectProjection
+from pants.engine.exp.struct import Struct
+from pants.util.objects import datatype
 
 
 class ResolvedTypeMismatchError(ResolveError):
   """Indicates a resolved object was not of the expected type."""
 
 
-class Resolver(Resolvable):
-  """Lazily resolves addressables using a graph."""
+def _key_func(entry):
+  key, value = entry
+  return key
 
-  def __init__(self, graph, address):
-    self._graph = graph
-    self._address = address
 
-  def address(self):
-    return self._address.spec
+class BuildFilePaths(datatype('BuildFilePaths', ['paths'])):
+  """A list of Paths that are known to match a BUILD file pattern.
 
-  def resolve(self):
-    return self._graph.resolve(self._address)
+  TODO: Because BUILD file names are matched using a regex, this cannot currently use PathGlobs.
+  If we were willing to allow a bit of slop in terms of files read, this could use
+  PathGlobs to get FilesContent for all files with the right prefix, and then discard.
+  """
 
-  def __hash__(self):
-    return hash((self._graph, self._address))
+
+def filter_buildfile_paths(address_mapper, directory_listing):
+  build_files = tuple(f for f in directory_listing.files
+                      if address_mapper.build_pattern.match(os_path_basename(f.path)))
+  return BuildFilePaths(build_files)
+
+
+def parse_address_family(address_mapper, path, build_files_content):
+  """Given the contents of the build files in one directory, return an AddressFamily.
+
+  The AddressFamily may be empty, but it will not be None.
+  """
+  address_maps = []
+  for filepath, filecontent in build_files_content.dependencies:
+    address_maps.append(AddressMap.parse(filepath,
+                                         filecontent,
+                                         address_mapper.symbol_table_cls,
+                                         address_mapper.parser_cls))
+  return AddressFamily.create(path.path, address_maps)
+
+
+class UnhydratedStruct(datatype('UnhydratedStruct', ['address', 'struct', 'dependencies'])):
+  """A product type that holds a Struct which has not yet been hydrated.
+
+  A Struct counts as "hydrated" when all of its members (which are not themselves dependencies
+  lists) have been resolved from the graph. This means that hyrating a struct is eager in terms
+  of inline addressable fields, but lazy in terms of the complete graph walk represented by
+  the `dependencies` field of StructWithDeps.
+  """
 
   def __eq__(self, other):
-    return (isinstance(other, Resolver) and
-            (self._graph, self._address) == (other._graph, other._address))
+    if type(self) != type(other):
+      return NotImplemented
+    return self.struct == other.struct
 
   def __ne__(self, other):
     return not (self == other)
 
-  def __repr__(self):
-    return 'Graph.Resolver(graph={}, address={!r})'.format(self._graph, self._address)
+  def __hash__(self):
+    return hash(self.struct)
 
 
-class Graph(object):
-  """A lazy, directed acyclic graph of objects. Not necessarily connected."""
+def _raise_did_you_mean(address_family, name):
+  possibilities = '\n  '.join(str(a) for a in address_family.addressables)
+  raise ResolveError('A Struct was not found in namespace {} for name "{}". '
+                     'Did you mean one of?:\n  {}'.format(address_family.namespace, name, possibilities))
 
-  def __init__(self, address_mapper, inline=False):
-    """Creates a build graph composed of addresses resolvable by an address mapper.
 
-    :param address_mapper: An address mapper that can resolve the objects addresses point to.
-    :type address_mapper: :class:`pants.engine.exp.mapper.AddressMapper`.
-    :param bool inline: If `True`, resolved addressables are inlined in the containing object;
-                        otherwise a resolvable pointer is used that dynamically traverses to the
-                        addressable on every access.
-    """
-    self._address_mapper = address_mapper
+def resolve_unhydrated_struct(address_family, address):
+  """Given an Address and its AddressFamily, resolve an UnhydratedStruct.
 
-    # TODO(John Sirois): This will need to be eliminated in favor of just using the AddressMapper
-    # caching or else also expose an invalidation interface based on address.spec_path - aka
-    # AddressMapper.namespace.
-    #
-    # Our resolution cache.
-    self._resolved_by_address = {}
+  Recursively collects any embedded addressables within the Struct, but will not walk into a
+  dependencies field, since those are requested explicitly by tasks using SelectDependencies.
+  """
 
-    self._inline = inline
+  struct = address_family.addressables.get(address)
+  if not struct:
+    _raise_did_you_mean(address_family, address.target_name)
 
-  def resolve(self, address):
-    """Resolves the object pointed at by the given `address`.
+  dependencies = []
+  def maybe_append(outer_key, value):
+    if isinstance(value, six.string_types):
+      if outer_key != 'dependencies':
+        dependencies.append(Address.parse(value, relative_to=address.spec_path))
+    elif isinstance(value, Struct):
+      collect_dependencies(value)
 
-    The object will be hydrated from the BUILD graph along with any objects it points to.
-
-    The following lifecycle for resolved objects is observed:
-    1. The object's containing BUILD file family is parsed if not already parsed.  This is a 'thin'
-       parse that just hydrates immediate fields of objects defined in the BUILD file family.
-    2. The object's addressed values are all first resolved completely if not already resolved.
-    3. The object is reconstructed using the fully resolved values from step 2.
-    4. If the reconstructed object is a :class:`pants.engine.exp.objects.SerializableFactory`, its
-       `create` method is called to allow for a replacement object to be supplied.
-    5. The reconstructed object from step 3 (or replacement object from step 4) is validated if
-       it's an instance of :class:`pants.engine.exp.objects.Validatable`.
-    6. The fully resolved and validated object is cached and returned.
-
-    :param address: The BUILD graph address to resolve.
-    :type address: :class:`pants.build_graph.address.Address`
-    :returns: The object pointed at by the given `address`.
-    :raises: :class:`ResolveError` if no object was found at the given `address`.
-    :raises: :class:`pants.engine.exp.objects.ValidationError` if the object was resolvable but
-             invalid.
-    """
-    try:
-      return self._resolve_recursively(address)
-    except MappingError as e:
-      raise ResolveError('Failed to resolve {}: {}'.format(address, e))
-
-  def _resolve_recursively(self, address, resolve_path=None):
-    resolved = self._resolved_by_address.get(address)
-    if resolved:
-      return resolved
-
-    resolve_path = resolve_path or []
-    if address in resolve_path:
-      raise CycleError('Cycle detected along path:\n\t{}'
-                       .format('\n\t'.join('* {}'.format(a) if a == address else str(a)
-                                           for a in resolve_path + [address])))
-    resolve_path.append(address)
-
-    obj = self._address_mapper.resolve(strip_config_selector(address))
-
-    def parse_addr(a):
-      return Address.parse(a, relative_to=address.spec_path)
-
-    def resolve_item(item, addr=None):
-      if Serializable.is_serializable(item):
-        hydrated_args = {'address': addr} if addr else {}
-
-        # Recurse on the Serializable's values and hydrates any addressables found.  This unwinds
-        # from the leaves thus hydrating item's closure in the inline case.
-        for key, value in item._asdict().items():
-          is_addressable = AddressableDescriptor.is_addressable(item, key)
-
-          def maybe_addr(x):
-            return parse_addr(x) if is_addressable and isinstance(x, six.string_types) else x
-
-          if isinstance(value, collections.MutableMapping):
-            container_type = type(value)
-            container = container_type()
-            container.update((k, resolve_item(maybe_addr(v))) for k, v in value.items())
-            hydrated_args[key] = container
-          elif isinstance(value, collections.MutableSequence):
-            container_type = type(value)
-            hydrated_args[key] = container_type(resolve_item(maybe_addr(v)) for v in value)
-          else:
-            hydrated_args[key] = resolve_item(maybe_addr(value))
-
-        # Re-build the thin Serializable with either fully hydrated objects or Resolvables
-        # substituted for all Address values; ie: Only ever expose fully resolved or resolvable
-        # closures for requested addresses.
-        return self._hydrate(type(item), **hydrated_args)
-      elif isinstance(item, Address):
-        if self._inline:
-          return self._resolve_recursively(item, resolve_path)
-        else:
-          # TODO(John Sirois): Implement lazy cycle checks across Resolver chains.
-          return Resolver(self, address=item)
+  def collect_dependencies(item):
+    for key, value in sorted(item._asdict().items(), key=_key_func):
+      if not AddressableDescriptor.is_addressable(item, key):
+        continue
+      if isinstance(value, collections.MutableMapping):
+        for _, v in sorted(value.items(), key=_key_func):
+          maybe_append(key, v)
+      elif isinstance(value, collections.MutableSequence):
+        for v in value:
+          maybe_append(key, v)
       else:
-        return item
+        maybe_append(key, value)
 
-    resolved = resolve_item(obj, addr=address)
-    resolve_path.pop(-1)
-    self._resolved_by_address[address] = resolved
-    return resolved
+  collect_dependencies(struct)
+  return UnhydratedStruct(address, struct, dependencies)
 
-  @staticmethod
-  def _hydrate(item_type, **kwargs):
-    try:
-      item = item_type(**kwargs)
-    except TypeConstraintError as e:
-      raise ResolvedTypeMismatchError(e)
 
-    # Let factories replace the hydrated object.
-    if isinstance(item, SerializableFactory):
-      item = item.create()
+def hydrate_struct(unhydrated_struct, dependencies):
+  """Hydrates a Struct from an UnhydratedStruct and its satisfied embedded addressable deps.
 
-    # Finally make sure objects that can self-validate get a chance to do so before we cache
-    # them as the pointee of `hydrated_item.address`.
-    if isinstance(item, Validatable):
-      item.validate()
+  Note that this relies on the guarantee that DependenciesNode provides dependencies in the
+  order they were requested.
+  """
+  address = unhydrated_struct.address
+  struct = unhydrated_struct.struct
 
-    return item
+  def maybe_consume(outer_key, value):
+    if isinstance(value, six.string_types):
+      if outer_key == 'dependencies':
+        # Don't recurse into the dependencies field of a Struct, since those will be explicitly
+        # requested by tasks. But do ensure that their addresses are absolute, since we're
+        # about to lose the context in which they were declared.
+        value = Address.parse(value, relative_to=address.spec_path)
+      else:
+        value = dependencies[maybe_consume.idx]
+        maybe_consume.idx += 1
+    elif isinstance(value, Struct):
+      value = consume_dependencies(value)
+    return value
+  # NB: Some pythons throw an UnboundLocalError for `idx` if it is a simple local variable.
+  maybe_consume.idx = 0
+
+  # 'zip' the previously-requested dependencies back together as struct fields.
+  def consume_dependencies(item, args=None):
+    hydrated_args = args or {}
+    for key, value in sorted(item._asdict().items(), key=_key_func):
+      if not AddressableDescriptor.is_addressable(item, key):
+        hydrated_args[key] = value
+        continue
+
+      if isinstance(value, collections.MutableMapping):
+        container_type = type(value)
+        hydrated_args[key] = container_type((k, maybe_consume(key, v))
+                                            for k, v in sorted(value.items(), key=_key_func))
+      elif isinstance(value, collections.MutableSequence):
+        container_type = type(value)
+        hydrated_args[key] = container_type(maybe_consume(key, v) for v in value)
+      else:
+        hydrated_args[key] = maybe_consume(key, value)
+    return _hydrate(type(item), address.spec_path, **hydrated_args)
+
+  return consume_dependencies(struct, args={'address': address})
+
+
+def _hydrate(item_type, spec_path, **kwargs):
+  # If the item will be Locatable, inject the spec_path.
+  if issubclass(item_type, Locatable):
+    kwargs['spec_path'] = spec_path
+
+  try:
+    item = item_type(**kwargs)
+  except TypeConstraintError as e:
+    raise ResolvedTypeMismatchError(e)
+
+  # Let factories replace the hydrated object.
+  if isinstance(item, SerializableFactory):
+    item = item.create()
+
+  # Finally make sure objects that can self-validate get a chance to do so.
+  if isinstance(item, Validatable):
+    item.validate()
+
+  return item
+
+
+def identity(v):
+  return v
+
+
+def address_from_address_family(address_family, single_address):
+  """Given an AddressFamily and a SingleAddress, return an Addresses object containing the Address.
+
+  Raises an exception if the SingleAddress does not match an existing Address.
+  """
+  name = single_address.name
+  if name is None:
+    name = os_path_basename(single_address.directory)
+  if name not in address_family.objects_by_name:
+    _raise_did_you_mean(address_family, single_address.name)
+  return Addresses(tuple([Address(address_family.namespace, name)]))
+
+
+def addresses_from_address_family(address_family):
+  """Given an AddressFamily, return an Addresses objects containing all of its `addressables`."""
+  return Addresses(tuple(address_family.addressables.keys()))
+
+
+def addresses_from_address_families(address_families):
+  """Given a list of AddressFamiliess, return an Addresses object containing all addressables."""
+  return Addresses(tuple(a for af in address_families for a in af.addressables.keys()))
+
+
+def create_graph_tasks(address_mapper, symbol_table_cls):
+  """Creates tasks used to parse Structs from BUILD files.
+
+  :param address_mapper_key: The subject key for an AddressMapper instance.
+  :param symbol_table_cls: A SymbolTable class to provide symbols for Address lookups.
+  """
+  return [
+    # Support for resolving Structs from Addresses
+    (Struct,
+     [Select(UnhydratedStruct),
+      SelectDependencies(Struct, UnhydratedStruct)],
+     hydrate_struct),
+    (UnhydratedStruct,
+     [SelectProjection(AddressFamily, Path, ('spec_path',), Address),
+      Select(Address)],
+     resolve_unhydrated_struct),
+  ] + [
+    # BUILD file parsing.
+    (AddressFamily,
+     [SelectLiteral(address_mapper, AddressMapper),
+      Select(Path),
+      SelectProjection(FilesContent, Paths, ('paths',), BuildFilePaths)],
+     parse_address_family),
+    (BuildFilePaths,
+     [SelectLiteral(address_mapper, AddressMapper),
+      Select(DirectoryListing)],
+     filter_buildfile_paths),
+  ] + [
+    # Addresses for user-defined products might possibly be resolvable from BLD files. These tasks
+    # define that lookup for each literal product.
+    (product,
+     [Select(Struct)],
+     identity)
+    for product in symbol_table_cls.table().values()
+  ] + [
+    # Spec handling.
+    (Addresses,
+     [SelectProjection(AddressFamily, Path, ('directory',), SingleAddress),
+      Select(SingleAddress)],
+     address_from_address_family),
+    (Addresses,
+     [SelectProjection(AddressFamily, Path, ('directory',), SiblingAddresses)],
+     addresses_from_address_family),
+    (Addresses,
+     [SelectDependencies(AddressFamily, RecursiveSubDirectories)],
+     addresses_from_address_families),
+    # TODO: This is a workaround for the fact that we can't currently "project" in a
+    # SelectDependencies clause: we launch the recursion by requesting RecursiveSubDirectories
+    # for a Directory projected from DescendantAddresses.
+    (RecursiveSubDirectories,
+     [SelectProjection(RecursiveSubDirectories, Path, ('directory',), DescendantAddresses)],
+     identity),
+  ]

@@ -10,95 +10,78 @@ import unittest
 from contextlib import closing, contextmanager
 
 from pants.build_graph.address import Address
-from pants.engine.exp.engine import (Engine, LocalMultiprocessEngine, LocalSerialEngine,
-                                     SerializationError)
-from pants.engine.exp.examples.planners import (ApacheThriftError, Classpath, Javac, Sources,
-                                                setup_json_scheduler)
-from pants.engine.exp.scheduler import BuildRequest, Promise
+from pants.engine.exp.engine import LocalMultiprocessEngine, LocalSerialEngine, SerializationError
+from pants.engine.exp.examples.planners import Classpath, setup_json_scheduler
+from pants.engine.exp.nodes import Return, SelectNode
+from pants.engine.exp.storage import Cache, Storage
 
 
 class EngineTest(unittest.TestCase):
   def setUp(self):
     build_root = os.path.join(os.path.dirname(__file__), 'examples', 'scheduler_inputs')
-    self.graph, self.scheduler = setup_json_scheduler(build_root)
+    self.scheduler, self.storage = setup_json_scheduler(build_root, debug=True)
+    self.cache = Cache.create(Storage.create())
 
-    def resolve(spec):
-      return self.graph.resolve(Address.parse(spec))
+    self.java = Address.parse('src/java/codegen/simple')
 
-    self.java = resolve('src/java/codegen/simple')
-    self.java_fail_slow = resolve('src/java/codegen/selector:failing')
-    self.failing_thrift = resolve('src/thrift/codegen/selector:selector@failing')
+  def request(self, goals, *addresses):
+    return self.scheduler.build_request(goals=goals,
+                                        subjects=addresses)
 
   def assert_engine(self, engine):
-    build_request = BuildRequest(goals=['compile'], addressable_roots=[self.java.address])
-    result = engine.execute(build_request)
-    self.assertEqual({Promise(Classpath, self.java): Javac.fake_product()},
+    result = engine.execute(self.request(['compile'], self.java))
+    self.assertEqual({SelectNode(self.java, Classpath, None, None):
+                      Return(Classpath(creator='javac'))},
                      result.root_products)
     self.assertIsNone(result.error)
 
   @contextmanager
   def multiprocessing_engine(self, pool_size=None):
-    with closing(LocalMultiprocessEngine(self.scheduler, pool_size=pool_size, debug=True)) as e:
+    with closing(LocalMultiprocessEngine(self.scheduler, self.storage, self.cache,
+                                         pool_size=pool_size, debug=True)) as e:
+      e.start()
       yield e
 
-  def test_serial_engine(self):
-    engine = LocalSerialEngine(self.scheduler)
+  def test_serial_engine_simple(self):
+    engine = LocalSerialEngine(self.scheduler, self.storage, self.cache)
     self.assert_engine(engine)
 
-  def test_multiprocess_engine(self):
+  def test_multiprocess_engine_multi(self):
     with self.multiprocessing_engine() as engine:
       self.assert_engine(engine)
 
-  def test_multiprocess_engine_single_process(self):
+  def test_multiprocess_engine_single(self):
     with self.multiprocessing_engine(pool_size=1) as engine:
       self.assert_engine(engine)
 
-  def assert_engine_fail_slow(self, engine):
-    build_request = BuildRequest(goals=['compile'],
-                                 addressable_roots=[self.java.address, self.java_fail_slow.address])
-    result = engine.execute(build_request, fail_slow=True)
-    self.assertEqual({Promise(Classpath, self.java): Javac.fake_product()},
-                     result.root_products)
-
-    self.assertIsInstance(result.error, Engine.PartialFailureError)
-    self.assertEqual(1, len(result.error.failed_to_produce))
-    failed_promise = Promise(Classpath, self.java_fail_slow)
-    failed_to_produce = result.error.failed_to_produce[failed_promise]
-    failing_configuration = self.failing_thrift.select_configuration('failing')
-    self.assertEqual([Promise(Sources.of('.java'), self.failing_thrift, failing_configuration),
-                      Promise(Classpath, self.failing_thrift, failing_configuration),
-                      Promise(Classpath, self.java_fail_slow)],
-                     [ftp.promise for ftp in failed_to_produce.walk(postorder=True)])
-    errors = [ftp.error for ftp in failed_to_produce.walk(postorder=True)]
-    self.assertEqual(3, len(errors))
-    root_error = errors[0]
-    self.assertIsInstance(root_error, ApacheThriftError)
-    self.assertEqual([None, None], errors[1:])
-
-  def test_serial_engine_fail_slow(self):
-    engine = LocalSerialEngine(self.scheduler)
-    self.assert_engine_fail_slow(engine)
-
-  def test_multiprocess_engine_fail_slow(self):
-    with self.multiprocessing_engine() as engine:
-      self.assert_engine_fail_slow(engine)
-
-  def test_multiprocess_engine_fail_slow_single_process(self):
-    with self.multiprocessing_engine(pool_size=1) as engine:
-      self.assert_engine_fail_slow(engine)
-
-  def test_multiprocess_unpicklable_inputs(self):
-    build_request = BuildRequest(goals=['unpickleable_inputs'],
-                                 addressable_roots=[self.java.address])
+  def test_multiprocess_unpickleable(self):
+    build_request = self.request(['unpickleable'], self.java)
 
     with self.multiprocessing_engine() as engine:
       with self.assertRaises(SerializationError):
         engine.execute(build_request)
 
-  def test_multiprocess_unpicklable_outputs(self):
-    build_request = BuildRequest(goals=['unpickleable_result'],
-                                 addressable_roots=[self.java.address])
-
+  @unittest.skip('https://github.com/pantsbuild/pants/issues/3149')
+  def test_rerun_with_cache(self):
     with self.multiprocessing_engine() as engine:
-      with self.assertRaises(SerializationError):
-        engine.execute(build_request)
+      self.assert_engine(engine)
+
+      cache_stats = engine._cache.get_stats()
+      # First run all misses.
+      self.assertTrue(cache_stats.hits == 0)
+
+      # Save counts for the first run to prepare for another run.
+      max_steps, misses, total = self.scheduler._step_id, cache_stats.misses, cache_stats.total
+
+      self.scheduler.product_graph.invalidate()
+      self.assert_engine(engine)
+
+      # Second run executes same number of steps, and are all cache hits, no more misses.
+      self.assertEquals(max_steps * 2, self.scheduler._step_id)
+      self.assertEquals(total * 2, cache_stats.total)
+      self.assertEquals(misses, cache_stats.misses)
+      self.assertTrue(cache_stats.hits > 0)
+
+      # Ensure we cache no more than what can be cached.
+      for request, result in engine._cache.items():
+        self.assertTrue(request[0].is_cacheable)

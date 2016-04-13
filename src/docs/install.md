@@ -13,6 +13,23 @@ beginning, make sure your machine fits the requirements. At a minimum, pants req
 After you have pants installed, you'll need to
 [[Set up your code workspace to work with Pants|pants('src/docs:setup_repo')]].
 
+
+The ./pants Runner Script
+-------------------------
+
+We highly recommend invoking pants via a checked-in runner script named `pants` in the
+root of your workspace (aka the "buildroot").  Pants uses the presence of such a file, in the
+current working directory or in any of its ancestors, to detect the buildroot, e.g., when
+invoked in a subdirectory.
+
+If, for whatever reason, you don't want to run pants that way, you can also just check in an
+empty file named `pants` to act as a sentinel for the buildroot.
+
+Note that you can create whatever symlinks or extra wrapper scripts you like.  There's no absolute
+requirement that pants be invoked directly via `./pants`.  All pants cares about is the existence
+of a file named `pants` in the buildroot, and that file might as well be the runner script!
+
+
 Virtualenv-based Installation
 -----------------------------
 
@@ -34,7 +51,7 @@ version of pants you just installed:
 Then add an entry like so to pants.ini with that version:
 
       :::ini
-      [DEFAULT]
+      [GLOBAL]
       pants_version: 0.0.42
 
 When you'd like to upgrade pants, just edit the version in pants.ini and pants will self-update on
@@ -46,7 +63,7 @@ If you use pants plugins published to pypi you can configure them by adding a `p
 follows:
 
       :::ini
-      [DEFAULT]
+      [GLOBAL]
       pants_version: 0.0.42
 
       plugins: [

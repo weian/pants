@@ -21,28 +21,22 @@ from pants.build_graph.target import Target
 from pants_test.tasks.task_test_base import ConsoleTaskTestBase
 
 
-class BaseReverseDepmapTest(ConsoleTaskTestBase):
-
+class ReverseDepmapEmptyTest(ConsoleTaskTestBase):
   @classmethod
   def task_type(cls):
     return ReverseDepmap
 
-  def assert_console_output(self, *args, **kwargs):
-    # Ensure that the globally-registered spec_excludes option is set, as Dependees consults it.
-    options = {'spec_excludes': []}
-    if 'options' in kwargs:
-      options.update(kwargs['options'])
-    kwargs['options'] = options
-    return super(BaseReverseDepmapTest, self).assert_console_output(*args, **kwargs)
-
-
-class ReverseDepmapEmptyTest(BaseReverseDepmapTest):
-
   def test(self):
     self.assert_console_output(targets=[])
 
+  def test_output_format_json(self):
+    self.assert_console_output('{}', targets=[], options={'output_format': 'json'})
 
-class ReverseDepmapTest(BaseReverseDepmapTest):
+
+class BaseReverseDepmapTest(ConsoleTaskTestBase):
+  @classmethod
+  def task_type(cls):
+    return ReverseDepmap
 
   @property
   def alias_groups(self):
@@ -63,7 +57,7 @@ class ReverseDepmapTest(BaseReverseDepmapTest):
     )
 
   def setUp(self):
-    super(ReverseDepmapTest, self).setUp()
+    super(ConsoleTaskTestBase, self).setUp()
 
     def add_to_build_file(path, name, alias=False, deps=()):
       self.add_to_build_file(path, dedent("""
@@ -160,6 +154,8 @@ class ReverseDepmapTest(BaseReverseDepmapTest):
       )
       """))
 
+
+class ReverseDepmapTest(BaseReverseDepmapTest):
   def test_roots(self):
     self.assert_console_output(
       'overlaps:two',
@@ -181,6 +177,19 @@ class ReverseDepmapTest(BaseReverseDepmapTest):
       options={'closed': True}
     )
 
+  def test_closed_output_format_json(self):
+    self.assert_console_output(
+      dedent("""
+      {
+          "common/c:c": [
+              "common/c:c",
+              "overlaps:two"
+          ]
+      }""").lstrip('\n'),
+      targets=[self.target('common/c')],
+      options={'closed': True, 'output_format': 'json'}
+    )
+
   def test_transitive(self):
     self.assert_console_output(
       'overlaps:one',
@@ -189,6 +198,41 @@ class ReverseDepmapTest(BaseReverseDepmapTest):
       'overlaps:five',
       targets=[self.target('common/b')],
       options={'transitive': True}
+    )
+
+  def test_transitive_output_format_json(self):
+    self.assert_console_output(
+      dedent("""
+      {
+          "common/b:b": [
+              "overlaps:four",
+              "overlaps:three",
+              "overlaps:one",
+              "overlaps:five"
+          ]
+      }""").lstrip('\n'),
+      targets=[self.target('common/b')],
+      options={'transitive': True, 'output_format': 'json'}
+    )
+
+  def test_nodups_dependees_output_format_json(self):
+    self.assert_console_output(
+      dedent("""
+      {
+          "common/a:a": [
+              "overlaps:two",
+              "overlaps:three",
+              "overlaps:one"
+          ],
+          "overlaps:one": [
+              "overlaps:three"
+          ]
+      }""").lstrip('\n'),
+      targets=[
+        self.target('common/a'),
+        self.target('overlaps:one')
+      ],
+      options={'output_format': 'json'}
     )
 
   def test_nodups_dependees(self):
@@ -238,7 +282,7 @@ class ReverseDepmapTest(BaseReverseDepmapTest):
        targets=[self.target('resources/a:a_resources')]
     )
 
-  def test_with_spec_excludes(self):
+  def test_overlaps_without_build_ignore_patterns(self):
     self.assert_console_output(
       'overlaps:one',
       'overlaps:two',
@@ -246,7 +290,11 @@ class ReverseDepmapTest(BaseReverseDepmapTest):
       targets=[self.target('common/a')]
     )
 
-    self.assert_console_output(
-      targets=[self.target('common/a')],
-      options={'spec_excludes': ['overlaps']}
-    )
+
+class ReverseDepmapTestWithPantsBuildIgnore(BaseReverseDepmapTest):
+  @property
+  def build_ignore_patterns(self):
+    return ['overlaps']
+
+  def test_overlaps_with_build_ignore_patterns(self):
+    self.assert_console_output(targets=[self.target('common/a')])

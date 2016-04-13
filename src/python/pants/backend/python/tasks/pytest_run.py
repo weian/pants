@@ -26,6 +26,7 @@ from pants.backend.python.targets.python_tests import PythonTests
 from pants.backend.python.tasks.python_task import PythonTask
 from pants.base.build_environment import get_buildroot
 from pants.base.exceptions import TaskError, TestFailedTaskError
+from pants.base.hash_utils import Sharder
 from pants.base.workunit import WorkUnitLabel
 from pants.build_graph.target import Target
 from pants.task.testrunner_task_mixin import TestRunnerTaskMixin
@@ -36,8 +37,9 @@ from pants.util.process_handler import SubprocessProcessHandler
 from pants.util.strutil import safe_shlex_split
 
 
-# Initialize logging, since tests do not run via pants_exe (where it is usually done)
+# Initialize logging, since tests do not run via pants_exe (where it is usually done).
 logging.basicConfig()
+logger = logging.getLogger(__name__)
 
 
 class PythonTestResult(object):
@@ -70,6 +72,9 @@ class PythonTestResult(object):
 
 
 class PytestRun(TestRunnerTaskMixin, PythonTask):
+  """
+  :API: public
+  """
   _TESTING_TARGETS = [
     # Note: the requirement restrictions on pytest and pytest-cov match those in requirements.txt,
     # to avoid confusion when debugging pants tests.
@@ -79,8 +84,7 @@ class PytestRun(TestRunnerTaskMixin, PythonTask):
     #   https://github.com/pantsbuild/pants/issues/2566
     PythonRequirement('pytest-timeout<1.0.0'),
     PythonRequirement('pytest-cov>=1.8,<1.9'),
-    PythonRequirement('unittest2', version_filter=lambda py, pl: py.startswith('2')),
-    PythonRequirement('unittest2py3k', version_filter=lambda py, pl: py.startswith('3'))
+    PythonRequirement('unittest2>=0.6.0,<=1.9.0'),
   ]
 
   @classmethod
@@ -90,13 +94,10 @@ class PytestRun(TestRunnerTaskMixin, PythonTask):
   @classmethod
   def register_options(cls, register):
     super(PytestRun, cls).register_options(register)
-    register('--fast', action='store_true', default=True,
+    register('--fast', type=bool, default=True,
              help='Run all tests in a single chroot. If turned off, each test target will '
                   'create a new chroot, which will be much slower, but more correct, as the'
                   'isolation verifies that all dependencies are correctly declared.')
-    register('--fail-slow', action='store_true', default=False,
-             help='Do not fail fast on the first test failure in a suite; instead run all tests '
-                  'and report errors only after all tests complete.')
     register('--junit-xml-dir', metavar='<DIR>',
              help='Specifying a directory causes junit xml results files to be emitted under '
                   'that dir for each test run.')
@@ -105,11 +106,14 @@ class PytestRun(TestRunnerTaskMixin, PythonTask):
                   "emitted to that file (prefix). Note that tests may run in a different cwd, so "
                   "it's best to use an absolute path to make it easy to find the subprocess "
                   "profiles later.")
-    register('--options', action='append', help='Pass these options to pytest.')
+    register('--options', type=list, help='Pass these options to pytest.')
     register('--coverage',
              help='Emit coverage information for specified paths/modules. Value has two forms: '
                   '"module:list,of,modules" or "path:list,of,paths"')
-    register('--shard',
+    register('--coverage-output-dir', metavar='<DIR>', default=None,
+             help='Directory to emit coverage reports to.'
+             'If not specified, a default within dist is used.')
+    register('--test-shard',
              help='Subset of tests to run, in the form M/N, 0 <= M < N. For example, 1/3 means '
                   'run tests number 2, 5, 8, 11, ...')
 
@@ -150,73 +154,59 @@ class PytestRun(TestRunnerTaskMixin, PythonTask):
         raise TestFailedTaskError(failed_targets=result.failed_targets)
     else:
       results = {}
-      # Coverage often throws errors despite tests succeeding, so force failsoft in that case.
-      fail_hard = not self.get_options().fail_slow and not self.get_options().coverage
       for target in targets:
         rv = self._do_run_tests([target], workunit)
         results[target] = rv
-        if not rv.success and fail_hard:
+        if not rv.success and self.get_options().fail_fast:
           break
 
       for target in sorted(results):
         self.context.log.info('{0:80}.....{1:>10}'.format(target.id, str(results[target])))
 
-      failed_targets = [target for target, rv in results.items() if not rv.success]
+      failed_targets = [target for target, _rv in results.items() if not _rv.success]
       if failed_targets:
         raise TestFailedTaskError(failed_targets=failed_targets)
 
   class InvalidShardSpecification(TaskError):
-    """Indicates an invalid `--shard` option."""
+    """Indicates an invalid `--test-shard` option."""
 
   @contextmanager
   def _maybe_shard(self):
-    shard_spec = self.get_options().shard
-    if not shard_spec:
+    shard_spec = self.get_options().test_shard
+    if shard_spec is None:
       yield []
       return
 
-    components = shard_spec.split('/', 1)
-    if len(components) != 2:
-      raise self.InvalidShardSpecification("Invalid shard specification '{}', should be of form: "
-                                           "[shard index]/[total shards]".format(shard_spec))
+    try:
+      sharder = Sharder(shard_spec)
 
-    def ensure_int(item):
-      try:
-        return int(item)
-      except ValueError:
-        raise self.InvalidShardSpecification("Invalid shard specification '{}', item {} is not an "
-                                             "int".format(shard_spec, item))
+      if sharder.nshards < 2:
+        yield []
+        return
 
-    shard = ensure_int(components[0])
-    total = ensure_int(components[1])
-    if not (0 <= shard and shard < total):
-      raise self.InvalidShardSpecification("Invalid shard specification '{}', shard must "
-                                           "be >= 0 and < {}".format(shard_spec, total))
-    if total < 2:
-      yield []
-      return
-
-    with temporary_dir() as tmp:
-      path = os.path.join(tmp, 'conftest.py')
-      with open(path, 'w') as fp:
-        fp.write(dedent("""
-          def pytest_report_header(config):
-            return 'shard: {shard} of {total} (0-based shard numbering)'
+      with temporary_dir() as tmp:
+        path = os.path.join(tmp, 'conftest.py')
+        with open(path, 'w') as fp:
+          fp.write(dedent("""
+            def pytest_report_header(config):
+              return 'shard: {shard} of {nshards} (0-based shard numbering)'
 
 
-          def pytest_collection_modifyitems(session, config, items):
-            total_count = len(items)
-            removed = 0
-            for i, item in enumerate(list(items)):
-              if i % {total} != {shard}:
-                del items[i - removed]
-                removed += 1
-            reporter = config.pluginmanager.getplugin('terminalreporter')
-            reporter.write_line('Only executing {{}} of {{}} total tests in shard {shard} of '
-                                '{total}'.format(total_count - removed, total_count),
-                                bold=True, invert=True, yellow=True)
-        """.format(shard=shard, total=total)))
-      yield [path]
+            def pytest_collection_modifyitems(session, config, items):
+              total_count = len(items)
+              removed = 0
+              for i, item in enumerate(list(items)):
+                if i % {nshards} != {shard}:
+                  del items[i - removed]
+                  removed += 1
+              reporter = config.pluginmanager.getplugin('terminalreporter')
+              reporter.write_line('Only executing {{}} of {{}} total tests in shard {shard} of '
+                                  '{nshards}'.format(total_count - removed, total_count),
+                                  bold=True, invert=True, yellow=True)
+          """.format(shard=sharder.shard, nshards=sharder.nshards)))
+        yield [path]
+    except Sharder.InvalidShardSpec as e:
+      raise self.InvalidShardSpecification(e)
 
   @contextmanager
   def _maybe_emit_junit_xml(self, targets):
@@ -390,27 +380,35 @@ class PytestRun(TestRunnerTaskMixin, PythonTask):
         with environment_as(PEX_MODULE='coverage.cmdline:main'):
           def pex_run(args):
             return self._pex_run(pex, workunit, args=args)
-          # Normalize .coverage.raw paths using combine and `paths` config in the rc file.
-          # This swaps the /tmp pex chroot source paths for the local original source paths
-          # the pex was generated from and which the user understands.
-          shutil.move('.coverage', '.coverage.raw')
-          pex_run(args=['combine', '--rcfile', coverage_rc])
-          pex_run(args=['report', '-i', '--rcfile', coverage_rc])
 
-          # TODO(wickman): If coverage is enabled and we are not using fast mode, write an
-          # intermediate .html that points to each of the coverage reports generated and
-          # webbrowser.open to that page.
-          # TODO(John Sirois): Possibly apply the same logic to the console report.  In fact,
-          # consider combining coverage files from all runs in this Tasks's execute and then
-          # producing just 1 console and 1 html report whether or not the tests are run in fast
-          # mode.
-          relpath = Target.maybe_readable_identify(targets)
-          pants_distdir = self.context.options.for_global_scope().pants_distdir
-          target_dir = os.path.join(pants_distdir, 'coverage', relpath)
-          safe_mkdir(target_dir)
-          pex_run(args=['html', '-i', '--rcfile', coverage_rc, '-d', target_dir])
-          coverage_xml = os.path.join(target_dir, 'coverage.xml')
-          pex_run(args=['xml', '-i', '--rcfile', coverage_rc, '-o', coverage_xml])
+          # On failures or timeouts, the .coverage file won't be written.
+          if not os.path.exists('.coverage'):
+            logger.warning('No .coverage file was found! Skipping coverage reporting.')
+          else:
+            # Normalize .coverage.raw paths using combine and `paths` config in the rc file.
+            # This swaps the /tmp pex chroot source paths for the local original source paths
+            # the pex was generated from and which the user understands.
+            shutil.move('.coverage', '.coverage.raw')
+            pex_run(args=['combine', '--rcfile', coverage_rc])
+            pex_run(args=['report', '-i', '--rcfile', coverage_rc])
+
+            # TODO(wickman): If coverage is enabled and we are not using fast mode, write an
+            # intermediate .html that points to each of the coverage reports generated and
+            # webbrowser.open to that page.
+            # TODO(John Sirois): Possibly apply the same logic to the console report.  In fact,
+            # consider combining coverage files from all runs in this Tasks's execute and then
+            # producing just 1 console and 1 html report whether or not the tests are run in fast
+            # mode.
+            if self.get_options().coverage_output_dir:
+              target_dir = self.get_options().coverage_output_dir
+            else:
+              relpath = Target.maybe_readable_identify(targets)
+              pants_distdir = self.context.options.for_global_scope().pants_distdir
+              target_dir = os.path.join(pants_distdir, 'coverage', relpath)
+            safe_mkdir(target_dir)
+            pex_run(args=['html', '-i', '--rcfile', coverage_rc, '-d', target_dir])
+            coverage_xml = os.path.join(target_dir, 'coverage.xml')
+            pex_run(args=['xml', '-i', '--rcfile', coverage_rc, '-o', coverage_xml])
 
   @contextmanager
   def _test_runner(self, targets, workunit):
@@ -464,8 +462,12 @@ class PytestRun(TestRunnerTaskMixin, PythonTask):
   # F testprojects/tests/python/pants/constants_only/test_fail.py::test_boom
   # F testprojects/tests/python/pants/constants_only/test_fail.py::TestClassName::test_boom
 
+
+  # If a failure happens outside a function, then the resultlog will have a pattern like this:
+  # F testprojects/tests/python/pants/constants_only/test_fail.py
+
   # 'E' is here as well to catch test errors, not just test failures.
-  RESULTLOG_FAILED_PATTERN = re.compile(r'[EF] +(.+?)::(.+)')
+  RESULTLOG_FAILED_PATTERN = re.compile(r'^[EF] +(?P<file>.+?)(::.+)?$')
 
   @classmethod
   def _get_failed_targets_from_resultlogs(cls, filename, targets):
@@ -473,7 +475,7 @@ class PytestRun(TestRunnerTaskMixin, PythonTask):
       lines = fp.readlines()
 
     failed_files = {
-      m.groups()[0] for m in map(cls.RESULTLOG_FAILED_PATTERN.match, lines) if m and m.groups()
+      m.group('file') for m in map(cls.RESULTLOG_FAILED_PATTERN.match, lines) if m and m.groups()
     }
 
     failed_targets = set()
@@ -517,6 +519,8 @@ class PytestRun(TestRunnerTaskMixin, PythonTask):
       # top of the buildroot. This prevents conftest.py files from outside (e.g. in users home dirs)
       # from leaking into pants test runs. See: https://github.com/pantsbuild/pants/issues/2726
       args = ['--confcutdir', get_buildroot()]
+      if self.get_options().fail_fast:
+        args.extend(['-x'])
       if self._debug:
         args.extend(['-s'])
       if self.get_options().colors:

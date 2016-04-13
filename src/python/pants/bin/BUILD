@@ -17,7 +17,8 @@ python_library(
     'src/python/pants/base:build_file',
     'src/python/pants/base:cmd_line_spec_parser',
     'src/python/pants/base:exceptions',
-    'src/python/pants/base:scm_build_file',
+    'src/python/pants/base:file_system_project_tree',
+    'src/python/pants/base:scm_project_tree',
     'src/python/pants/base:workunit',
     'src/python/pants/build_graph',
     'src/python/pants/core_tasks',
@@ -42,9 +43,7 @@ python_library(
 target(
   name = 'plugins',
   dependencies = [
-    'src/python/pants/backend/authentication',
     'src/python/pants/backend/codegen:plugin',
-    'src/python/pants/backend/core:plugin',
     'src/python/pants/backend/docgen:plugin',
     'src/python/pants/backend/graph_info:plugin',
     'src/python/pants/backend/jvm:plugin',
@@ -73,7 +72,7 @@ python_binary(
   entry_point='pants.bin.pants_exe:main',
   dependencies=[
     ':bin',
+    'contrib/python/src/python/pants/contrib/python/checks/tasks/checkstyle:all',
     'pants-plugins/src/python/internal_backend:plugins',
-    'src/python/pants/backend/android:plugin',
   ],
 )

@@ -14,6 +14,19 @@
 #   ...
 # }
 #
+
+PKG_ANDROID=(
+  "pantsbuild.pants.contrib.android"
+  "//contrib/android/src/python/pants/contrib/android:plugin"
+  "pkg_android_install_test"
+)
+function pkg_android_install_test() {
+  execute_packaged_pants_with_internal_backends \
+    --plugins="['pantsbuild.pants.contrib.android==$(local_version)']" \
+    --explain apk | grep "apk" &> /dev/null
+}
+
+
 PKG_SCROOGE=(
   "pantsbuild.pants.contrib.scrooge"
   "//contrib/scrooge/src/python/pants/contrib/scrooge:plugin"
@@ -61,19 +74,6 @@ function pkg_go_install_test() {
       test.go contrib/go/examples::
 }
 
-# TODO (ggonzalez): Change the `compile.stack-build` goal to `test.stack-test`
-# once the Haskell plugins adds support for the `test` goal.
-PKG_HASKELL=(
-  "pantsbuild.pants.contrib.haskell"
-  "//contrib/haskell/src/python/pants/contrib/haskell:plugin"
-  "pkg_haskell_install_test"
-)
-function pkg_haskell_install_test() {
-  execute_packaged_pants_with_internal_backends \
-      --plugins="['pantsbuild.pants.contrib.haskell==$(local_version)']" \
-      compile.stack-build contrib/haskell/examples::
-}
-
 PKG_NODE=(
   "pantsbuild.pants.contrib.node"
   "//contrib/node/src/python/pants/contrib/node:plugin"
@@ -83,6 +83,17 @@ function pkg_node_install_test() {
   execute_packaged_pants_with_internal_backends \
       --plugins="['pantsbuild.pants.contrib.node==$(local_version)']" \
       test.node contrib/node/examples::
+}
+
+PKG_SCALAJS=(
+  "pantsbuild.pants.contrib.scalajs"
+  "//contrib/scalajs/src/python/pants/contrib/scalajs:plugin"
+  "pkg_scalajs_install_test"
+)
+function pkg_scalajs_install_test() {
+  execute_packaged_pants_with_internal_backends \
+      --plugins="['pantsbuild.pants.contrib.scalajs==$(local_version)']" \
+      test contrib/scalajs::
 }
 
 PKG_PYTHON_CHECKS=(
@@ -101,11 +112,12 @@ function pkg_python_checks_install_test() {
 
 # Once individual (new) package is declared above, insert it into the array below)
 CONTRIB_PACKAGES=(
+  PKG_ANDROID
   PKG_SCROOGE
   PKG_BUILDGEN
   PKG_SPINDLE
   PKG_GO
-  PKG_HASKELL
   PKG_NODE
   PKG_PYTHON_CHECKS
+  PKG_SCALAJS
 )

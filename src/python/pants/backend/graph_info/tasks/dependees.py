@@ -5,10 +5,10 @@
 from __future__ import (absolute_import, division, generators, nested_scopes, print_function,
                         unicode_literals, with_statement)
 
+import json
 from collections import defaultdict
 
 from pants.backend.graph_info.tasks.target_filter_task_mixin import TargetFilterTaskMixin
-from pants.base.build_environment import get_buildroot
 from pants.task.console_task import ConsoleTask
 
 
@@ -18,22 +18,23 @@ class ReverseDepmap(TargetFilterTaskMixin, ConsoleTask):
   @classmethod
   def register_options(cls, register):
     super(ReverseDepmap, cls).register_options(register)
-    register('--transitive', default=False, action='store_true',
+    register('--transitive', type=bool,
              help='List transitive dependees.')
-    register('--closed', default=False, action='store_true',
+    register('--closed', type=bool,
              help='Include the input targets in the output along with the dependees.')
+    # TODO: consider refactoring out common output format methods into MultiFormatConsoleTask.
+    register('--output-format', default='text', choices=['text', 'json'],
+             help='Output format of results.')
 
   def __init__(self, *args, **kwargs):
     super(ReverseDepmap, self).__init__(*args, **kwargs)
 
     self._transitive = self.get_options().transitive
     self._closed = self.get_options().closed
-    self._spec_excludes = self.get_options().spec_excludes
 
   def console_output(self, _):
     address_mapper = self.context.address_mapper
-    buildfiles = address_mapper.scan_buildfiles(get_buildroot(),
-                                                spec_excludes=self._spec_excludes)
+    buildfiles = address_mapper.scan_build_files(base_path=None)
 
     build_graph = self.context.build_graph
     build_file_parser = self.context.build_file_parser
@@ -53,12 +54,21 @@ class ReverseDepmap(TargetFilterTaskMixin, ConsoleTask):
           dependees_by_target[dependency].add(target)
 
     roots = set(self.context.target_roots)
-    if self._closed:
+    if self.get_options().output_format == 'json':
+      deps = defaultdict(list)
       for root in roots:
-        yield root.address.spec
+        if self._closed:
+          deps[root.address.spec].append(root.address.spec)
+        for dependent in self.get_dependents(dependees_by_target, [root]):
+          deps[root.address.spec].append(dependent.address.spec)
+      yield json.dumps(deps, indent=4, separators=(',', ': '))
+    else:
+      if self._closed:
+        for root in roots:
+          yield root.address.spec
 
-    for dependent in self.get_dependents(dependees_by_target, roots):
-      yield dependent.address.spec
+      for dependent in self.get_dependents(dependees_by_target, roots):
+        yield dependent.address.spec
 
   def get_dependents(self, dependees_by_target, roots):
     check = set(roots)

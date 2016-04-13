@@ -12,6 +12,11 @@ from collections import namedtuple
 from pants.util.meta import AbstractClass
 
 
+class SerializationError(Exception):
+  """Indicates an error serializing an object."""
+
+
+# TODO: Likely no longer necessary, due to the laziness of the product graph.
 class Resolvable(AbstractClass):
   """Represents a resolvable object."""
 
@@ -27,6 +32,15 @@ class Resolvable(AbstractClass):
 def _unpickle_serializable(serializable_class, kwargs):
   # A pickle-compatible top-level function for custom unpickling of Serializables.
   return serializable_class(**kwargs)
+
+
+class Locatable(AbstractClass):
+  """Marks a class whose constructor should receive its spec_path relative to the build root.
+
+  Locatable objects will be passed a `spec_path` constructor kwarg that indicates where they
+  were parsed. If the object also has a `name` (not all do), then these two fields can be
+  combined into an Address.
+  """
 
 
 class SerializablePickle(namedtuple('CustomPickle', ['unpickle_func', 'args'])):
@@ -107,14 +121,14 @@ class SerializableFactory(AbstractClass):
 
 
 class ValidationError(Exception):
-  """Indicates an invalid configuration was provided."""
+  """Indicates invalid fields on an object."""
 
   def __init__(self, identifier, message):
     """Creates a validation error pertaining to the identified invalid object.
 
     :param object identifier: Any object whose string representation identifies the invalid object
                               that led to this validation error.
-    :param string message: A message describing the invalid configuration.
+    :param string message: A message describing the invalid Struct field.
     """
     super(ValidationError, self).__init__('Failed to validate {id}: {msg}'
                                           .format(id=identifier, msg=message))
@@ -125,7 +139,15 @@ class Validatable(AbstractClass):
 
   @abstractmethod
   def validate(self):
-    """Check this object's configuration is valid.
+    """Check that this object's fields are valid.
 
     :raises: :class:`ValidationError` if this object is invalid.
     """
+
+
+class Closable(object):
+  """Marks a class that cleans up itself, usually at the end of lifecycle."""
+
+  def close(self):
+    """A no-op implementation, overwrite to actually clean up resources etc."""
+    return

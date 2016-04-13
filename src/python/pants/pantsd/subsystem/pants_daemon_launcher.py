@@ -10,9 +10,13 @@ import os
 
 from pants.base.build_environment import get_buildroot
 from pants.pantsd.pants_daemon import PantsDaemon
+from pants.pantsd.service.fs_event_service import FSEventService
 from pants.pantsd.service.pailgun_service import PailgunService
-from pants.process.pidlock import OwnerPrintingPIDLockFile
+from pants.pantsd.service.scheduler_service import SchedulerService
+from pants.pantsd.subsystem.watchman_launcher import WatchmanLauncher
+from pants.process.lock import OwnerPrintingInterProcessFileLock
 from pants.subsystem.subsystem import Subsystem
+from pants.util.memo import testable_memoized_property
 
 
 class PantsDaemonLauncher(Subsystem):
@@ -28,30 +32,47 @@ class PantsDaemonLauncher(Subsystem):
              help='The port to bind the pants nailgun server to. Defaults to a random port.')
     register('--log-dir', advanced=True, default=None,
              help='The directory to log pantsd output to.')
+    register('--fs-event-detection', advanced=True, type=bool,
+             help='Whether or not to use filesystem event detection. Experimental.')
+    register('--fs-event-workers', advanced=True, type=int, default=4,
+             help='The number of workers to use for the filesystem event service executor pool.'
+                  ' Experimental.')
+
+  @classmethod
+  def subsystem_dependencies(cls):
+    return super(PantsDaemonLauncher, cls).subsystem_dependencies() + (WatchmanLauncher.Factory,)
 
   def __init__(self, *args, **kwargs):
     super(PantsDaemonLauncher, self).__init__(*args, **kwargs)
-    self.options = self.get_options()
     self._logger = logging.getLogger(__name__)
     self._build_root = get_buildroot()
-    self._pants_workdir = self.options.pants_workdir
-    self._log_dir = self.options.log_dir
-    self._log_level = self.options.level.upper()
-    self._pailgun_host = self.options.pailgun_host
-    self._pailgun_port = self.options.pailgun_port
+
+    options = self.get_options()
+    self._pants_workdir = options.pants_workdir
+    self._log_dir = options.log_dir
+    self._log_level = options.level.upper()
+    self._pailgun_host = options.pailgun_host
+    self._pailgun_port = options.pailgun_port
+    self._fs_event_enabled = options.fs_event_detection
+    self._fs_event_workers = options.fs_event_workers
+
     self._pantsd = None
-    self._lock = OwnerPrintingPIDLockFile(os.path.join(self._build_root, '.pantsd.startup'))
+    self._scheduler = None
+    self._lock = OwnerPrintingInterProcessFileLock(
+      os.path.join(self._build_root, '.pantsd.startup'))
 
-  @property
+  @testable_memoized_property
   def pantsd(self):
-    if not self._pantsd:
-      self._pantsd = PantsDaemon(self._build_root,
-                                 self._pants_workdir,
-                                 self._log_level,
-                                 self._log_dir)
-    return self._pantsd
+    return PantsDaemon(self._build_root, self._pants_workdir, self._log_level, self._log_dir)
 
-  def _setup_services(self):
+  @testable_memoized_property
+  def watchman_launcher(self):
+    return WatchmanLauncher.Factory.global_instance().create()
+
+  def set_scheduler(self, scheduler):
+    self._scheduler = scheduler
+
+  def _setup_services(self, watchman):
     """Initialize pantsd services.
 
     :returns: A tuple of (`tuple` service_instances, `dict` port_map).
@@ -64,17 +85,25 @@ class PantsDaemonLauncher(Subsystem):
     pailgun_service = PailgunService((self._pailgun_host, self._pailgun_port),
                                      DaemonExiter,
                                      DaemonPantsRunner)
+    services = [pailgun_service]
+
+    if self._fs_event_enabled and self._scheduler:
+      fs_event_service = FSEventService(watchman, self._build_root, self._fs_event_workers)
+      scheduler_service = SchedulerService(self._scheduler, fs_event_service)
+      services.extend((fs_event_service, scheduler_service))
 
     # Construct a mapping of named ports used by the daemon's services. In the default case these
     # will be randomly assigned by the underlying implementation so we can't reference via options.
     port_map = dict(pailgun=pailgun_service.pailgun_port)
-    services = (pailgun_service,)
 
-    return services, port_map
+    return tuple(services), port_map
 
   def _launch_pantsd(self):
+    # Launch Watchman (if so configured).
+    watchman = self.watchman_launcher.maybe_launch() if self._fs_event_enabled else None
+
     # Initialize pantsd services.
-    services, port_map = self._setup_services()
+    services, port_map = self._setup_services(watchman)
 
     # Setup and fork pantsd.
     self.pantsd.set_services(services)
@@ -96,3 +125,5 @@ class PantsDaemonLauncher(Subsystem):
 
   def terminate(self):
     self.pantsd.terminate()
+    if self._fs_event_enabled:
+      self.watchman_launcher.terminate()

@@ -6,10 +6,9 @@ from __future__ import (absolute_import, division, generators, nested_scopes, pr
                         unicode_literals, with_statement)
 
 import functools
-import hashlib
-import itertools
 import os
 from collections import defaultdict
+from multiprocessing import cpu_count
 
 from pants.backend.jvm.subsystems.java import Java
 from pants.backend.jvm.subsystems.jvm_platform import JvmPlatform
@@ -27,8 +26,8 @@ from pants.base.worker_pool import WorkerPool
 from pants.base.workunit import WorkUnitLabel
 from pants.build_graph.resources import Resources
 from pants.build_graph.target import Target
+from pants.build_graph.target_scopes import Scopes
 from pants.goal.products import MultipleRootedProducts
-from pants.option.custom_types import list_option
 from pants.reporting.reporting_utils import items_to_report_element
 from pants.util.dirutil import fast_relpath, safe_delete, safe_mkdir, safe_walk
 from pants.util.fileutil import create_size_estimators
@@ -41,12 +40,12 @@ class ResolvedJarAwareTaskIdentityFingerprintStrategy(TaskIdentityFingerprintStr
     super(ResolvedJarAwareTaskIdentityFingerprintStrategy, self).__init__(task)
     self._classpath_products = classpath_products
 
-  def _build_hasher(self, target):
+  def compute_fingerprint(self, target):
     if isinstance(target, Resources):
       # Just do nothing, this kind of dependency shouldn't affect result's hash.
-      return hashlib.sha1()
+      return None
 
-    hasher = super(ResolvedJarAwareTaskIdentityFingerprintStrategy, self)._build_hasher(target)
+    hasher = self._build_hasher(target)
     if isinstance(target, JarLibrary):
       # NB: Collects only the jars for the current jar_library, and hashes them to ensure that both
       # the resolved coordinates, and the requested coordinates are used. This ensures that if a
@@ -57,7 +56,7 @@ class ResolvedJarAwareTaskIdentityFingerprintStrategy(TaskIdentityFingerprintStr
         [target])
       for _, entry in classpath_entries:
         hasher.update(str(entry.coordinate))
-    return hasher
+    return hasher.hexdigest()
 
   def __hash__(self):
     return hash((type(self), self._task.fingerprint))
@@ -75,6 +74,8 @@ class JvmCompile(NailgunTaskBase):
   """
 
   size_estimators = create_size_estimators()
+  _target_closure_kwargs = dict(include_scopes=Scopes.JVM_COMPILE_SCOPES,
+                                respect_intransitive=True)
 
   @classmethod
   def size_estimator_by_name(cls, estimation_strategy_name):
@@ -91,54 +92,69 @@ class JvmCompile(NailgunTaskBase):
   @classmethod
   def register_options(cls, register):
     super(JvmCompile, cls).register_options(register)
-    register('--jvm-options', advanced=True, type=list_option, default=[],
-             help='Run the compiler with these JVM options.')
 
-    register('--args', advanced=True, action='append',
+    register('--args', advanced=True, type=list,
              default=list(cls.get_args_default(register.bootstrap)), fingerprint=True,
-             help='Pass these args to the compiler.')
+             help='Pass these extra args to the compiler.')
 
-    register('--confs', advanced=True, type=list_option, default=['default'],
+    register('--confs', advanced=True, type=list, default=['default'],
              help='Compile for these Ivy confs.')
 
     # TODO: Stale analysis should be automatically ignored via Task identities:
     # https://github.com/pantsbuild/pants/issues/1351
-    register('--clear-invalid-analysis', advanced=True, default=False, action='store_true',
+    register('--clear-invalid-analysis', advanced=True, type=bool,
              help='When set, any invalid/incompatible analysis files will be deleted '
                   'automatically.  When unset, an error is raised instead.')
 
-    register('--warnings', default=True, action='store_true', fingerprint=True,
+    register('--warnings', default=True, type=bool, fingerprint=True,
              help='Compile with all configured warnings enabled.')
 
-    register('--warning-args', advanced=True, action='append', fingerprint=True,
+    register('--warning-args', advanced=True, type=list, fingerprint=True,
              default=list(cls.get_warning_args_default()),
              help='Extra compiler args to use when warnings are enabled.')
 
-    register('--no-warning-args', advanced=True, action='append', fingerprint=True,
+    register('--no-warning-args', advanced=True, type=list, fingerprint=True,
              default=list(cls.get_no_warning_args_default()),
              help='Extra compiler args to use when warnings are disabled.')
 
-    register('--debug-symbols', default=False, action='store_true', fingerprint=True,
+    register('--fatal-warnings-enabled-args', advanced=True, type=list, fingerprint=True,
+             default=list(cls.get_fatal_warnings_enabled_args_default()),
+             help='Extra compiler args to use when fatal warnings are enabled.')
+
+    register('--fatal-warnings-disabled-args', advanced=True, type=list, fingerprint=True,
+             default=list(cls.get_fatal_warnings_disabled_args_default()),
+             help='Extra compiler args to use when fatal warnings are disabled.')
+
+    register('--debug-symbols', type=bool, fingerprint=True,
              help='Compile with debug symbol enabled.')
 
-    register('--debug-symbol-args', advanced=True, action='append', fingerprint=True,
+    register('--debug-symbol-args', advanced=True, type=list, fingerprint=True,
              default=['-C-g:lines,source,vars'],
              help='Extra args to enable debug symbol.')
 
-    register('--delete-scratch', advanced=True, default=True, action='store_true',
+    register('--delete-scratch', advanced=True, default=True, type=bool,
              help='Leave intermediate scratch files around, for debugging build problems.')
 
-    register('--worker-count', advanced=True, type=int, default=1,
+    register('--worker-count', advanced=True, type=int, default=cpu_count(),
              help='The number of concurrent workers to use when '
-                  'compiling with {task}.'.format(task=cls._name))
+                  'compiling with {task}. Defaults to the '
+                  'current machine\'s CPU count.'.format(task=cls._name))
 
     register('--size-estimator', advanced=True,
              choices=list(cls.size_estimators.keys()), default='filesize',
-             help='The method of target size estimation.')
+             help='The method of target size estimation. The size estimator estimates the size '
+                  'of targets in order to build the largest targets first (subject to dependency '
+                  'constraints). Choose \'random\' to choose random sizes for each target, which '
+                  'may be useful for distributed builds.')
 
-    register('--capture-log', advanced=True, action='store_true', default=False,
+    register('--capture-log', advanced=True, type=bool,
              fingerprint=True,
              help='Capture compilation output to per-target logs.')
+
+    register('--capture-classpath', advanced=True, type=bool, default=True,
+             fingerprint=True,
+             help='Capture classpath to per-target newline-delimited text files. These files will '
+                  'be packaged into any jar artifacts that are created from the jvm targets.')
 
   @classmethod
   def prepare(cls, options, round_manager):
@@ -194,6 +210,16 @@ class JvmCompile(NailgunTaskBase):
   @classmethod
   def get_no_warning_args_default(cls):
     """Override to set default for --no-warning-args option."""
+    return ()
+
+  @classmethod
+  def get_fatal_warnings_enabled_args_default(cls):
+    """Override to set default for --fatal-warnings-enabled-args option."""
+    return ()
+
+  @classmethod
+  def get_fatal_warnings_disabled_args_default(cls):
+    """Override to set default for --fatal-warnings-disabled-args option."""
     return ()
 
   @property
@@ -290,8 +316,6 @@ class JvmCompile(NailgunTaskBase):
 
     self._size_estimator = self.size_estimator_by_name(self.get_options().size_estimator)
 
-    self._worker_pool = None
-
     self._analysis_tools = self.create_analysis_tools()
 
   @property
@@ -328,27 +352,13 @@ class JvmCompile(NailgunTaskBase):
 
     # Clone the compile_classpath to the runtime_classpath.
     compile_classpath = self.context.products.get_data('compile_classpath')
-    runtime_classpath = self.context.products.get_data('runtime_classpath', compile_classpath.copy)
+    classpath_product = self.context.products.get_data('runtime_classpath', compile_classpath.copy)
 
-    # This ensures the workunit for the worker pool is set
-    with self.context.new_workunit('isolation-{}-pool-bootstrap'.format(self._name)) \
-            as workunit:
-      # This uses workunit.parent as the WorkerPool's parent so that child workunits
-      # of different pools will show up in order in the html output. This way the current running
-      # workunit is on the bottom of the page rather than possibly in the middle.
-      self._worker_pool = WorkerPool(workunit.parent,
-                                     self.context.run_tracker,
-                                     self._worker_count)
-
-
-
-    classpath_product = self.context.products.get_data('runtime_classpath')
     fingerprint_strategy = self._fingerprint_strategy(classpath_product)
     # Invalidation check. Everything inside the with block must succeed for the
     # invalid targets to become valid.
     with self.invalidated(relevant_targets,
                           invalidate_dependents=True,
-                          partition_size_hint=0,
                           fingerprint_strategy=fingerprint_strategy,
                           topological_order=True) as invalidation_check:
 
@@ -367,26 +377,37 @@ class JvmCompile(NailgunTaskBase):
       if invalidation_check.invalid_vts:
         invalid_targets = [vt.target for vt in invalidation_check.invalid_vts]
 
-        self.compile_chunk(invalidation_check,
+        self.do_compile(invalidation_check,
                            compile_contexts,
                            invalid_targets,
                            self.extra_compile_time_classpath_elements())
 
       # Once compilation has completed, replace the classpath entry for each target with
       # its jar'd representation.
-      classpath_products = self.context.products.get_data('runtime_classpath')
       for cc in compile_contexts.values():
         for conf in self._confs:
-          classpath_products.remove_for_target(cc.target, [(conf, cc.classes_dir)])
-          classpath_products.add_for_target(cc.target, [(conf, cc.jar_file)])
+          classpath_product.remove_for_target(cc.target, [(conf, cc.classes_dir)])
+          classpath_product.add_for_target(cc.target, [(conf, cc.jar_file)])
 
-  def compile_chunk(self,
-                    invalidation_check,
-                    compile_contexts,
-                    invalid_targets,
-                    extra_compile_time_classpath_elements):
+  def do_compile(self,
+                 invalidation_check,
+                 compile_contexts,
+                 invalid_targets,
+                 extra_compile_time_classpath_elements):
     """Executes compilations for the invalid targets contained in a single chunk."""
     assert invalid_targets, "compile_chunk should only be invoked if there are invalid targets."
+
+
+    # This ensures the workunit for the worker pool is set before attempting to compile.
+    with self.context.new_workunit('isolation-{}-pool-bootstrap'.format(self._name)) \
+            as workunit:
+      # This uses workunit.parent as the WorkerPool's parent so that child workunits
+      # of different pools will show up in order in the html output. This way the current running
+      # workunit is on the bottom of the page rather than possibly in the middle.
+      worker_pool = WorkerPool(workunit.parent,
+                               self.context.run_tracker,
+                               self._worker_count)
+
 
     # Prepare the output directory for each invalid target, and confirm that analysis is valid.
     for target in invalid_targets:
@@ -405,13 +426,21 @@ class JvmCompile(NailgunTaskBase):
                                      compile_contexts,
                                      extra_compile_time_classpath,
                                      invalid_targets,
-                                     invalidation_check.invalid_vts_partitioned)
+                                     invalidation_check.invalid_vts)
 
     exec_graph = ExecutionGraph(jobs)
     try:
-      exec_graph.execute(self._worker_pool, self.context.log)
+      exec_graph.execute(worker_pool, self.context.log)
     except ExecutionFailure as e:
       raise TaskError("Compilation failure: {}".format(e))
+
+  def _record_compile_classpath(self, classpath, targets, outdir):
+    text = '\n'.join(classpath)
+    for target in targets:
+      path = os.path.join(outdir, 'compile_classpath', '{}.txt'.format(target.id))
+      safe_mkdir(os.path.dirname(path), clean=False)
+      with open(path, 'w') as f:
+        f.write(text)
 
   def _compile_vts(self, vts, sources, analysis_file, upstream_analysis, classpath, outdir,
                    log_file, progress_message, settings, fatal_warnings, counter):
@@ -449,6 +478,8 @@ class JvmCompile(NailgunTaskBase):
         # change triggering the error is reverted, we won't rebuild to restore the missing
         # classfiles. So we force-invalidate here, to be on the safe side.
         vts.force_invalidate()
+        if self.get_options().capture_classpath:
+          self._record_compile_classpath(classpath, vts.targets, outdir)
         self.compile(self._args, classpath, sources, outdir, upstream_analysis, analysis_file,
                      log_file, settings, fatal_warnings)
 
@@ -512,13 +543,11 @@ class JvmCompile(NailgunTaskBase):
   def _register_vts(self, compile_contexts):
     classes_by_source = self.context.products.get_data('classes_by_source')
     product_deps_by_src = self.context.products.get_data('product_deps_by_src')
-    runtime_classpath = self.context.products.get_data('runtime_classpath')
 
     # Register a mapping between sources and classfiles (if requested).
     if classes_by_source is not None:
       ccbsbc = self.compute_classes_by_source(compile_contexts).items()
       for compile_context, computed_classes_by_source in ccbsbc:
-        target = compile_context.target
         classes_dir = compile_context.classes_dir
 
         for source in compile_context.sources:
@@ -543,7 +572,7 @@ class JvmCompile(NailgunTaskBase):
           for r in resolve(declared):
             yield r
         elif isinstance(declared, self.compiler_plugin_types):
-          for r in declared.closure(bfs=True):
+          for r in declared.closure(bfs=True, **self._target_closure_kwargs):
             yield r
         else:
           yield declared
@@ -560,12 +589,13 @@ class JvmCompile(NailgunTaskBase):
     target = compile_context.target
     if compile_context.strict_deps:
       classpath_targets = list(self._compute_strict_dependencies(target))
-      pruned = [t.address.spec for t in target.closure(bfs=True) if t not in classpath_targets]
+      pruned = [t.address.spec for t in target.closure(bfs=True, **self._target_closure_kwargs)
+                if t not in classpath_targets]
       self.context.log.debug(
           'Using strict classpath for {}, which prunes the following dependencies: {}'.format(
             target.address.spec, pruned))
     else:
-      classpath_targets = target.closure(bfs=True)
+      classpath_targets = target.closure(bfs=True, **self._target_closure_kwargs)
     return ClasspathUtil.compute_classpath(classpath_targets, classpath_products,
                                            extra_compile_time_classpath, self._confs)
 
@@ -588,7 +618,7 @@ class JvmCompile(NailgunTaskBase):
     return "compile({})".format(compile_target.address.spec)
 
   def _create_compile_jobs(self, classpath_products, compile_contexts, extra_compile_time_classpath,
-                           invalid_targets, invalid_vts_partitioned):
+                           invalid_targets, invalid_vts):
     class Counter(object):
       def __init__(self, size, initial=0):
         self.size = size
@@ -600,7 +630,7 @@ class JvmCompile(NailgunTaskBase):
 
       def format_length(self):
         return len(str(self.size))
-    counter = Counter(len(invalid_vts_partitioned))
+    counter = Counter(len(invalid_vts))
 
     def check_cache(vts):
       """Manually checks the artifact cache (usually immediately before compilation.)
@@ -661,7 +691,7 @@ class JvmCompile(NailgunTaskBase):
           # Otherwise, simply ensure that it is empty.
           safe_delete(tmp_analysis_file)
         target, = vts.targets
-        fatal_warnings = fatal_warnings = self._compute_language_property(target, lambda x: x.fatal_warnings)
+        fatal_warnings = self._compute_language_property(target, lambda x: x.fatal_warnings)
         self._compile_vts(vts,
                           compile_context.sources,
                           tmp_analysis_file,
@@ -687,9 +717,7 @@ class JvmCompile(NailgunTaskBase):
 
     jobs = []
     invalid_target_set = set(invalid_targets)
-    for vts in invalid_vts_partitioned:
-      assert len(vts.targets) == 1, ("Requested one target per partition, got {}".format(vts))
-
+    for vts in invalid_vts:
       # Invalidated targets are a subset of relevant targets: get the context for this one.
       compile_target = vts.targets[0]
       compile_context = compile_contexts[compile_target]

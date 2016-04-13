@@ -55,6 +55,11 @@ def get_pants_configdir():
   return os.path.expanduser(os.path.join(config_home, 'pants'))
 
 
+def get_default_pants_config_file():
+  """Return the default location of the pants config file."""
+  return os.path.join(get_buildroot(), 'pants.ini')
+
+
 _SCM = None
 
 
@@ -69,7 +74,7 @@ def get_scm():
     if worktree and os.path.isdir(worktree):
       git = Git(worktree=worktree)
       try:
-        logger.info('Detected git repository at {} on branch {}'.format(worktree, git.branch_name))
+        logger.debug('Detected git repository at {} on branch {}'.format(worktree, git.branch_name))
         set_scm(git)
       except git.LocalException as e:
         logger.info('Failed to load git repository at {}: {}'.format(worktree, e))

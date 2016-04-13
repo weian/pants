@@ -185,9 +185,16 @@ class ProcessMetadataManager(object):
 class ProcessManager(ProcessMetadataManager):
   """Subprocess/daemon management mixin/superclass. Not intended to be thread-safe."""
 
-  class ExecutionError(Exception): pass
   class InvalidCommandOutput(Exception): pass
   class NonResponsiveProcess(Exception): pass
+  class ExecutionError(Exception):
+    def __init__(self, message, output=None):
+      super(ProcessManager.ExecutionError, self).__init__(message)
+      self.message = message
+      self.output = output
+
+    def __repr__(self):
+      return '{}(message={!r}, output={!r})'.format(type(self).__name__, self.message, self.output)
 
   KILL_WAIT_SEC = 5
   KILL_CHAIN = (signal.SIGTERM, signal.SIGKILL)
@@ -258,9 +265,10 @@ class ProcessManager(ProcessMetadataManager):
     :returns: The output of the command.
     """
     try:
-      return subprocess.check_output(*args)
+      return subprocess.check_output(*args, stderr=subprocess.STDOUT)
     except (OSError, subprocess.CalledProcessError) as e:
-      raise cls.ExecutionError(str(e))
+      subprocess_output = getattr(e, 'output', '').strip()
+      raise cls.ExecutionError(str(e), subprocess_output)
 
   def await_pid(self, timeout):
     """Wait up to a given timeout for a process to write pid metadata."""
@@ -301,21 +309,29 @@ class ProcessManager(ProcessMetadataManager):
     """Return a boolean indicating whether the process is dead or not."""
     return not self.is_alive()
 
-  def is_alive(self):
-    """Return a boolean indicating whether the process is running or not."""
+  def is_alive(self, extended_check=None):
+    """Return a boolean indicating whether the process is running or not.
+
+    :param func extended_check: An additional callable that will be invoked to perform an extended
+                                liveness check. This callable should take a single argument of a
+                                `psutil.Process` instance representing the context-local process
+                                and return a boolean True/False to indicate alive vs not alive.
+    """
     try:
       process = self._as_process()
-      if not process:
+      return not (
         # Can happen if we don't find our pid.
-        return False
-      if (process.status() == psutil.STATUS_ZOMBIE or                    # Check for walkers.
-          (self.process_name and self.process_name != process.name())):  # Check for stale pids.
-        return False
+        (not process) or
+        # Check for walkers.
+        (process.status() == psutil.STATUS_ZOMBIE) or
+        # Check for stale pids.
+        (self.process_name and self.process_name != process.name()) or
+        # Extended checking.
+        (extended_check and not extended_check(process))
+      )
     except (psutil.NoSuchProcess, psutil.AccessDenied):
       # On some platforms, accessing attributes of a zombie'd Process results in NoSuchProcess.
       return False
-
-    return True
 
   def purge_metadata(self, force=False):
     """Instance-based version of ProcessMetadataManager.purge_metadata_by_name() that checks
@@ -338,6 +354,7 @@ class ProcessManager(ProcessMetadataManager):
     """Ensure a process is terminated by sending a chain of kill signals (SIGTERM, SIGKILL)."""
     alive = self.is_alive()
     if alive:
+      logger.debug('terminating {}'.format(self._name))
       for signal_type in signal_chain:
         pid = self.pid
         try:

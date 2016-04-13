@@ -6,44 +6,146 @@ from __future__ import (absolute_import, division, generators, nested_scopes, pr
                         unicode_literals, with_statement)
 
 import functools
-from abc import abstractmethod, abstractproperty
-
-from twitter.common.collections import OrderedSet
+import re
+from abc import abstractmethod
+from os import sep as os_sep
+from os.path import join as os_path_join
 
 from pants.base.exceptions import TaskError
+from pants.base.file_system_project_tree import FileSystemProjectTree
 from pants.build_graph.address import Address
 from pants.engine.exp.addressable import SubclassesOf, addressable_list
-from pants.engine.exp.configuration import Configuration
-from pants.engine.exp.graph import Graph
-from pants.engine.exp.mapper import AddressMapper
-from pants.engine.exp.parsers import parse_json
-from pants.engine.exp.products import Sources
-from pants.engine.exp.scheduler import LocalScheduler, Plan, Planners, Subject, Task, TaskPlanner
-from pants.engine.exp.targets import Sources as AddressableSources
-from pants.engine.exp.targets import Target
-from pants.util.memo import memoized, memoized_property
-
-
-class PrintingTask(Task):
-  @classmethod
-  def fake_product(cls):
-    return '<<<Fake{}Product>>>'.format(cls.__name__)
-
-  def execute(self, **inputs):
-    print('{} being executed with inputs: {}'.format(type(self).__name__, inputs))
-    return self.fake_product()
+from pants.engine.exp.examples.graph_validator import GraphValidator
+from pants.engine.exp.examples.parsers import JsonParser
+from pants.engine.exp.examples.sources import Sources
+from pants.engine.exp.fs import FileContent, FilesContent, Path, PathGlobs, Paths, create_fs_tasks
+from pants.engine.exp.graph import create_graph_tasks
+from pants.engine.exp.mapper import AddressFamily, AddressMapper
+from pants.engine.exp.parser import SymbolTable
+from pants.engine.exp.scheduler import LocalScheduler
+from pants.engine.exp.selectors import (Select, SelectDependencies, SelectLiteral, SelectProjection,
+                                        SelectVariant)
+from pants.engine.exp.storage import Storage
+from pants.engine.exp.struct import HasStructs, Struct, StructWithDeps, Variants
+from pants.util.meta import AbstractClass
+from pants.util.objects import datatype
 
 
 def printing_func(func):
   @functools.wraps(func)
-  def wrapper(**inputs):
-    print('{} being executed with inputs: {}'.format(func.__name__, inputs))
-    product = func(**inputs)
-    return product if product else '<<<Fake{}Product>>>'.format(func.__name__)
+  def wrapper(*inputs):
+    product = func(*inputs)
+    return_val = product if product else '<<<Fake-{}-Product>>>'.format(func.__name__)
+    print('{} executed for {}, returned: {}'.format(func.__name__, inputs, return_val))
+    return return_val
   return wrapper
 
 
-class Requirement(Configuration):
+class Target(Struct, HasStructs):
+  """A placeholder for the most-numerous Struct subclass.
+
+  This particular implementation holds a collection of other Structs in a `configurations` field.
+  """
+  collection_field = 'configurations'
+
+  def __init__(self, name=None, configurations=None, **kwargs):
+    """
+    :param string name: The name of this target which forms its address in its namespace.
+    :param list configurations: The configurations that apply to this target in various contexts.
+    """
+    super(Target, self).__init__(name=name, **kwargs)
+
+    self.configurations = configurations
+
+  @addressable_list(SubclassesOf(Struct))
+  def configurations(self):
+    """The configurations that apply to this target in various contexts.
+
+    :rtype list of :class:`pants.engine.exp.configuration.Struct`
+    """
+
+
+class JavaSources(Sources, StructWithDeps):
+  extensions = ('.java',)
+
+
+class ScalaSources(Sources, StructWithDeps):
+  extensions = ('.scala',)
+
+
+class PythonSources(Sources, StructWithDeps):
+  extensions = ('.py',)
+
+
+class ThriftSources(Sources, StructWithDeps):
+  extensions = ('.thrift',)
+
+
+class ResourceSources(Sources):
+  extensions = tuple()
+
+
+class ScalaInferredDepsSources(Sources):
+  """A Sources subclass which can be converted to ScalaSources via dep inference."""
+  extensions = ('.scala',)
+
+
+class ImportedJVMPackages(datatype('ImportedJVMPackages', ['dependencies'])):
+  """Holds a list of 'JVMPackageName' dependencies."""
+  pass
+
+
+class JVMPackageName(datatype('JVMPackageName', ['name'])):
+  """A typedef to represent a fully qualified JVM package name."""
+  pass
+
+
+@printing_func
+def select_package_address(jvm_package_name, address_families):
+  """Return the Address from the given AddressFamilies which provides the given package."""
+  addresses = [address for address_family in address_families
+                       for address in address_family.addressables.keys()]
+  if len(addresses) == 0:
+    raise ValueError('No targets existed in {} to provide {}'.format(
+      address_families, jvm_package_name))
+  elif len(addresses) > 1:
+    raise ValueError('Multiple targets might be able to provide {}:\n  {}'.format(
+      jvm_package_name, '\n  '.join(str(a) for a in addresses)))
+  return addresses[0]
+
+
+@printing_func
+def calculate_package_search_path(jvm_package_name, source_roots):
+  """Return Paths for directories where the given JVMPackageName might exist."""
+  rel_package_dir = jvm_package_name.name.replace('.', os_sep)
+  if not rel_package_dir.endswith(os_sep):
+    rel_package_dir += os_sep
+  specs = [os_path_join(srcroot, rel_package_dir) for srcroot in source_roots.srcroots]
+  return PathGlobs.create_from_specs('', specs)
+
+
+@printing_func
+def extract_scala_imports(source_files_content):
+  """A toy example of dependency inference. Would usually be a compiler plugin."""
+  packages = set()
+  import_re = re.compile(r'^import ([^;]*);?$')
+  for _, content in source_files_content.dependencies:
+    for line in content.splitlines():
+      match = import_re.search(line)
+      if match:
+        packages.add(match.group(1).rsplit('.', 1)[0])
+  return ImportedJVMPackages([JVMPackageName(p) for p in packages])
+
+
+@printing_func
+def reify_scala_sources(sources, dependency_addresses):
+  """Given a ScalaInferredDepsSources object and its inferred dependencies, create ScalaSources."""
+  kwargs = sources._asdict()
+  kwargs['dependencies'] = list(set(dependency_addresses))
+  return ScalaSources(**kwargs)
+
+
+class Requirement(Struct):
   """A setuptools requirement."""
 
   def __init__(self, req, repo=None, **kwargs):
@@ -54,12 +156,27 @@ class Requirement(Configuration):
     super(Requirement, self).__init__(req=req, repo=repo, **kwargs)
 
 
-class Classpath(object):
-  # Placeholder product.
-  pass
+class Classpath(Struct):
+  """Placeholder product."""
+
+  def __init__(self, creator, **kwargs):
+    super(Classpath, self).__init__(creator=creator, **kwargs)
 
 
-class Jar(Configuration):
+class ManagedResolve(Struct):
+  """A frozen ivy resolve that when combined with a ManagedJar can produce a Jar."""
+
+  def __init__(self, revs, **kwargs):
+    """
+    :param dict revs: A dict of artifact org#name to version.
+    """
+    super(ManagedResolve, self).__init__(revs=revs, **kwargs)
+
+  def __repr__(self):
+    return "ManagedResolve({})".format(self.revs)
+
+
+class Jar(Struct):
   """A java jar."""
 
   def __init__(self, org=None, name=None, rev=None, **kwargs):
@@ -72,153 +189,57 @@ class Jar(Configuration):
     super(Jar, self).__init__(org=org, name=name, rev=rev, **kwargs)
 
 
-class GlobalIvyResolvePlanner(TaskPlanner):
-  @property
-  def goal_name(self):
-    return 'resolve'
+class ManagedJar(Struct):
+  """A java jar template, which can be merged with a ManagedResolve to determine a concrete version."""
 
-  @property
-  def product_types(self):
-    return {Classpath: [[Jar]]}
-
-  def plan(self, scheduler, product_type, subject, configuration=None):
-    if isinstance(subject, Jar):
-      # This plan is only used internally, the finalized plan will s/jar/jars/ for a single global
-      # resolve.
-      return Plan(func_or_task_type=IvyResolve, subjects=(subject,), jar=subject)
-
-  def finalize_plans(self, plans):
-    subjects = set()
-    jars = OrderedSet()
-    for plan in plans:
-      subjects.update(plan.subjects)
-      jars.add(plan.jar)
-    global_plan = Plan(func_or_task_type=IvyResolve, subjects=subjects, jars=list(jars))
-    return [global_plan]
-
-
-class IvyResolve(PrintingTask):
-  def execute(self, jars):
-    return super(IvyResolve, self).execute(jars=jars)
-
-
-def _create_sources(ext):
-  # A pickle-compatible top-level function for custom unpickling of Sources per-extension types.
-  return Sources.of(ext)
-
-
-class ThriftConfiguration(Configuration):
-  def __init__(self, deps=None, **kwargs):
+  def __init__(self, org, name, **kwargs):
     """
-    :param deps: An optional list of dependencies needed by the generated code.
-    :type deps: list of jars
+    :param string org: The Maven ``groupId`` of this dependency.
+    :param string name: The Maven ``artifactId`` of this dependency; also serves as the name portion
+                        of the address of this jar if defined at the top level of a BUILD file.
     """
-    super(ThriftConfiguration, self).__init__(**kwargs)
-    self.deps = deps
-
-  # Could be Jars, PythonRequirements, ... we simply don't know a-priori - depends on --gen lang.
-  @addressable_list(SubclassesOf(Configuration))
-  def deps(self):
-    """Return a list of the dependencies needed by the generated code."""
+    super(ManagedJar, self).__init__(org=org, name=name, **kwargs)
 
 
-class ThriftPlanner(TaskPlanner):
-  @property
-  def goal_name(self):
-    return 'gen'
-
-  @abstractproperty
-  def product_type_by_config_type(self):
-    """A dict of configuration types to product types for this planner.
-
-    # This will come via an option default.
-    # TODO(John Sirois): once the options system is plumbed, make the languages configurable.
-    """
-
-  @abstractproperty
-  def gen_func(self):
-    """Return the code gen function.
-
-    :rtype: function
-    """
-
-  @abstractmethod
-  def plan_parameters(self, scheduler, product_type, subject, config):
-    """Return a dict of any extra parameters besides `sources` needed to execute the code gen plan.
-
-    :rtype: dict
-    """
-
-  @property
-  def product_types(self):
-    return {product_type: [[Sources.of('.thrift'), config_type]]
-            for config_type, product_type in self.product_type_by_config_type.items()}
-
-  def _extract_thrift_config(self, product_type, target, configuration=None):
-    """Return the configuration to be used to produce the given product type for the given target.
-
-    :rtype: :class:`ThriftConfiguration`
-    """
-    configs = (configuration,) if configuration else target.configurations
-    configs = tuple(config for config in configs
-                    if (product_type == self.product_type_by_config_type.get(type(config))))
-    if not configs:
-      # We don't know how to generate these type of sources for this subject.
-      raise self.Error('No configuration for generating {!r} from {!r}.'.format(product_type, target))
-    if len(configs) > 1:
-      raise self.Error('Found more than one configuration for generating {!r} from {!r}:\n\t{}'
-                       .format(product_type, target, '\n\t'.join(repr(c) for c in configs)))
-    return configs[0]
-
-  def plan(self, scheduler, product_type, subject, configuration=None):
-    thrift_sources = list(subject.sources.iter_paths(base_path=subject.address.spec_path,
-                                                     ext='.thrift'))
-    if not thrift_sources:
-      raise self.Error('No thrift sources for {!r} from {!r}.'.format(product_type, subject))
-
-    config = self._extract_thrift_config(product_type, subject, configuration=configuration)
-    subject = Subject(subject, alternate=Target(dependencies=config.deps))
-    inputs = self.plan_parameters(scheduler, product_type, subject, config)
-    return Plan(func_or_task_type=self.gen_func, subjects=(subject,), sources=thrift_sources, **inputs)
+@printing_func
+def select_rev(managed_jar, managed_resolve):
+  (org, name) = (managed_jar.org, managed_jar.name)
+  rev = managed_resolve.revs.get('{}#{}'.format(org, name), None)
+  if not rev:
+    raise TaskError('{} does not have a managed version in {}.'.format(managed_jar, managed_resolve))
+  return Jar(org=managed_jar.org, name=managed_jar.name, rev=rev)
 
 
-class ApacheThriftJavaConfiguration(ThriftConfiguration):
+@printing_func
+def ivy_resolve(jars):
+  return Classpath(creator='ivy_resolve')
+
+
+@printing_func
+def isolate_resources(resources):
+  """Copies resources into a private directory, and provides them as a Classpath entry."""
+  return Classpath(creator='isolate_resources')
+
+
+class ThriftConfiguration(StructWithDeps):
+  pass
+
+
+class ApacheThriftConfiguration(ThriftConfiguration):
   def __init__(self, rev=None, strict=True, **kwargs):
     """
     :param string rev: The version of the apache thrift compiler to use.
     :param bool strict: `False` to turn strict compiler warnings off (not recommended).
     """
-    super(ApacheThriftJavaConfiguration, self).__init__(rev=rev, strict=strict, **kwargs)
-
-  @abstractproperty
-  def gen(self):
-    pass
+    super(ApacheThriftConfiguration, self).__init__(rev=rev, strict=strict, **kwargs)
 
 
-class ApacheThriftJavaConfiguration(ThriftConfiguration):
-  gen = 'java'
+class ApacheThriftJavaConfiguration(ApacheThriftConfiguration):
+  pass
 
 
-class ApacheThriftPythonConfiguration(ThriftConfiguration):
-  gen = 'python'
-
-
-class ApacheThriftPlanner(ThriftPlanner):
-  @property
-  def gen_func(self):
-    return gen_apache_thrift
-
-  @memoized_property
-  def product_type_by_config_type(self):
-    return {
-        ApacheThriftJavaConfiguration: Sources.of('.java'),
-        ApacheThriftPythonConfiguration: Sources.of('.py'),
-      }
-
-  def plan_parameters(self, scheduler, product_type, subject, apache_thrift_config):
-    return dict(rev=apache_thrift_config.rev,
-                gen=apache_thrift_config.gen,
-                strict=apache_thrift_config.strict)
+class ApacheThriftPythonConfiguration(ApacheThriftConfiguration):
+  pass
 
 
 class ApacheThriftError(TaskError):
@@ -226,40 +247,24 @@ class ApacheThriftError(TaskError):
 
 
 @printing_func
-def gen_apache_thrift(sources, rev, gen, strict):
-  if rev == 'fail':
-    raise ApacheThriftError('Failed to generate via apache thrift for sources: {}, rev: {}, '
-                            'gen:{}, strict: {}'.format(sources, rev, gen, strict))
+def gen_apache_thrift(sources, config):
+  if config.rev == 'fail':
+    raise ApacheThriftError('Failed to generate via apache thrift for '
+                            'sources: {}, config: {}'.format(sources, config))
+  if isinstance(config, ApacheThriftJavaConfiguration):
+    return JavaSources(files=['Fake.java'], dependencies=config.dependencies)
+  elif isinstance(config, ApacheThriftPythonConfiguration):
+    return PythonSources(files=['fake.py'], dependencies=config.dependencies)
 
 
-class BuildPropertiesConfiguration(Configuration):
+class BuildPropertiesConfiguration(Struct):
   pass
 
 
-class BuildPropertiesPlanner(TaskPlanner):
-  """A planner that adds a Classpath entry for all targets configured for build_properties.
-
-  NB: In the absence of support for merging multiple Promises for a particular product_type,
-  this serves as a valid example that explodes when it should succeed.
-  """
-
-  @property
-  def goal_name(self):
-    return None
-
-  @property
-  def product_types(self):
-    return {Classpath: [[BuildPropertiesConfiguration]]}
-
-  def plan(self, scheduler, product_type, subject, configuration=None):
-    assert product_type == Classpath
-    return Plan(func_or_task_type=write_name_file, subjects=(subject,), name=subject.name)
-
-
+@printing_func
 def write_name_file(name):
-  # Write a file containing the name in CWD
-  with safe_open('build.properties') as f:
-    f.write('name={}\n'.format(name))
+  """Write a file containing the name of this target in the CWD."""
+  return Classpath(creator='write_name_file')
 
 
 class ScroogeConfiguration(ThriftConfiguration):
@@ -268,196 +273,243 @@ class ScroogeConfiguration(ThriftConfiguration):
     :param string rev: The version of the scrooge compiler to use.
     :param bool strict: `False` to turn strict compiler warnings off (not recommended).
     """
-    super(ScroogeScalaConfiguration, self).__init__(rev=rev, strict=strict, **kwargs)
-
-  @abstractproperty
-  def lang(self):
-    pass
+    super(ScroogeConfiguration, self).__init__(rev=rev, strict=strict, **kwargs)
 
 
-class ScroogeScalaConfiguration(ThriftConfiguration):
-  lang = 'scala'
-
-
-class ScroogeJavaConfiguration(ThriftConfiguration):
-  lang = 'java'
-
-
-class ScroogePlanner(ThriftPlanner):
-  @property
-  def gen_func(self):
-    return gen_scrooge_thrift
-
-  @memoized_property
-  def product_type_by_config_type(self):
-    return {
-        ScroogeJavaConfiguration: Sources.of('.java'),
-        ScroogeScalaConfiguration: Sources.of('.scala'),
-      }
-
-  def plan_parameters(self, scheduler, product_type, subject, scrooge_config):
-    # This will come via an option default.
-    # TODO(John Sirois): once the options system is plumbed, make the tool spec configurable.
-    # It could also just be pointed at the scrooge jar at that point.
-    scrooge_classpath = scheduler.promise(Address.parse('src/scala/scrooge'), Classpath)
-    return dict(scrooge_classpath=scrooge_classpath,
-                lang=scrooge_config.lang,
-                strict=scrooge_config.strict)
-
-
-@printing_func
-def gen_scrooge_thrift(sources, scrooge_classpath, lang, strict):
+class ScroogeScalaConfiguration(ScroogeConfiguration):
   pass
 
 
-class JvmCompilerPlanner(TaskPlanner):
-  @property
-  def goal_name(self):
-    return 'compile'
-
-  @property
-  def product_types(self):
-    return {Classpath: [[Sources.of(self.source_ext)]]}
-
-  @abstractproperty
-  def compile_task_type(self):
-    """Return the type of the jvm compiler task.
-
-    :rtype: type
-    """
-
-  @abstractproperty
-  def source_ext(self):
-    """Return the extension of the source code compiled by the jvm compiler.
-
-    :rtype: string
-    """
-
-  def plan(self, scheduler, product_type, subject, configuration=None):
-    sources = list(subject.sources.iter_paths(base_path=subject.address.spec_path,
-                                              ext=self.source_ext))
-    if not sources:
-      # TODO(John Sirois): Abstract a ~SourcesConsumerPlanner that can grab sources of given types
-      # or else defer to a code generator like we do here.  As it stands, the planner must
-      # explicitly allow for code generators and this repeated code / foresight can easily be
-      # missed in new compilers, and other source-using tasks.  Once done though, code gen can be
-      # introduced to any nesting depth, ie: code gen '.thrift' files.
-
-      # This is a dep graph "hole", we depend on the thing but don't know what it is.  Either it
-      # could be something that gets transformed in to our compile input source extension (codegen)
-      # or transformed into a `Classpath` product by some other compiler targeting the jvm.
-      sources = scheduler.promise(subject,
-                                  Sources.of(self.source_ext),
-                                  configuration=configuration)
-      subject = sources.subject
-
-    classpath_promises = []
-    for dep, dep_config in self.iter_configured_dependencies(subject):
-      # This could recurse to us (or be satisfied by IvyResolve, another jvm compiler, etc.
-      # depending on the dep type).
-      classpath = scheduler.promise(dep, Classpath, configuration=dep_config)
-      classpath_promises.append(classpath)
-
-    return Plan(func_or_task_type=self.compile_task_type,
-                subjects=(subject,),
-                sources=sources,
-                classpath=classpath_promises)
+class ScroogeJavaConfiguration(ScroogeConfiguration):
+  pass
 
 
-class JavacPlanner(JvmCompilerPlanner):
-  @property
-  def source_ext(self):
-    return '.java'
-
-  @property
-  def compile_task_type(self):
-    return Javac
+@printing_func
+def gen_scrooge_thrift(sources, config, scrooge_classpath):
+  if isinstance(config, ScroogeJavaConfiguration):
+    return JavaSources(files=['Fake.java'], dependencies=config.dependencies)
+  elif isinstance(config, ScroogeScalaConfiguration):
+    return ScalaSources(files=['Fake.scala'], dependencies=config.dependencies)
 
 
-class Javac(PrintingTask):
-  def execute(self, sources, classpath):
-    return super(Javac, self).execute(sources=sources, classpath=classpath)
+@printing_func
+def javac(sources, classpath):
+  return Classpath(creator='javac')
 
 
-class ScalacPlanner(JvmCompilerPlanner):
-  @property
-  def source_ext(self):
-    return '.scala'
-
-  @property
-  def compile_task_type(self):
-    return Scalac
-
-
-class Scalac(PrintingTask):
-  def execute(self, sources, classpath):
-    return super(Scalac, self).execute(sources=sources, classpath=classpath)
+@printing_func
+def scalac(sources, classpath):
+  return Classpath(creator='scalac')
 
 
 # TODO(John Sirois): When https://github.com/pantsbuild/pants/issues/2413 is resolved, move the
 # unpickleable input and output test planners below to engine test.  There will be less setup
 # required at that point since no target addresses will need to be supplied in the build_request.
-class UnpickleableInputsPlanner(TaskPlanner):
-  @property
-  def goal_name(self):
-    return 'unpickleable_inputs'
-
-  @property
-  def product_types(self):
-    # A convenient product type only, will never be used outside engine internals.
-    return {Sources.of('unpickleable_inputs'): [[]]}
-
-  def plan(self, scheduler, product_type, subject, configuration=None):
-    # Nested functions like this lambda are unpicklable.
-    return Plan(lambda: None, (subject,))
+class UnpickleableOutput(object):
+  pass
 
 
-def unpickable_result_func():
+class UnpickleableResult(object):
+  pass
+
+
+def unpickleable_output():
+  """Generates an unpickleable output."""
   # Nested functions like this lambda are unpicklable.
   return lambda: None
 
 
-class UnpickleableResultPlanner(TaskPlanner):
-  @property
-  def goal_name(self):
-    return 'unpickleable_result'
-
-  @property
-  def product_types(self):
-    # A convenient product type only, will never be used outside engine internals.
-    return {Sources.of('unpickleable_result'): [[Sources.of('unpickleable_inputs')]]}
-
-  def plan(self, scheduler, product_type, subject, configuration=None):
-    return Plan(unpickable_result_func, (subject,))
+def unpickleable_input(unpickleable):
+  raise Exception('This function should never run, because its selected input is unpickleable.')
 
 
-def setup_json_scheduler(build_root):
+class Goal(AbstractClass):
+  """A synthetic aggregate product produced by a goal, which is its own task."""
+
+  def __init__(self, *args):
+    if all(arg is None for arg in args):
+      msg = '\n  '.join(p.__name__ for p in self.products())
+      raise TaskError('Unable to produce any of the products for goal `{}`:\n  {}'.format(
+        self.name(), msg))
+
+  @classmethod
+  @abstractmethod
+  def name(cls):
+    """Returns the name of the Goal."""
+
+  @classmethod
+  def signature(cls):
+    """Returns a task triple for this Goal, used to install the Goal.
+
+    A Goal is it's own synthetic output product, and its constructor acts as its task function. It
+    selects each of its products as optional, but fails synchronously if none of them are available.
+    """
+    return (cls, [Select(p, optional=True) for p in cls.products()], cls)
+
+  @classmethod
+  @abstractmethod
+  def products(cls):
+    """Returns the products that this Goal requests."""
+
+  def __eq__(self, other):
+    return type(self) == type(other)
+
+  def __ne__(self, other):
+    return not (self == other)
+
+  def __hash__(self):
+    return hash(type(self))
+
+  def __str__(self):
+    return '{}()'.format(type(self).__name__)
+
+  def __repr__(self):
+    return str(self)
+
+
+class GenGoal(Goal):
+  """A goal that requests all known types of sources."""
+
+  @classmethod
+  def name(cls):
+    return 'gen'
+
+  @classmethod
+  def products(cls):
+    return [JavaSources, PythonSources, ResourceSources, ScalaSources]
+
+
+class SourceRoots(datatype('SourceRoots', ['srcroots'])):
+  """Placeholder for the SourceRoot subsystem."""
+
+
+class ExampleTable(SymbolTable):
+  @classmethod
+  def table(cls):
+    return {'apache_thrift_java_configuration': ApacheThriftJavaConfiguration,
+            'apache_thrift_python_configuration': ApacheThriftPythonConfiguration,
+            'jar': Jar,
+            'managed_jar': ManagedJar,
+            'managed_resolve': ManagedResolve,
+            'requirement': Requirement,
+            'scrooge_java_configuration': ScroogeJavaConfiguration,
+            'scrooge_scala_configuration': ScroogeScalaConfiguration,
+            'java': JavaSources,
+            'python': PythonSources,
+            'resources': ResourceSources,
+            'scala': ScalaSources,
+            'thrift': ThriftSources,
+            'target': Target,
+            'variants': Variants,
+            'build_properties': BuildPropertiesConfiguration,
+            'inferred_scala': ScalaInferredDepsSources}
+
+
+def setup_json_scheduler(build_root, debug=True):
   """Return a build graph and scheduler configured for BLD.json files under the given build root.
 
-  :rtype tuple of (:class:`pants.engine.exp.graph.Graph`,
-                   :class:`pants.engine.exp.scheduler.LocalScheduler`)
+  :rtype A tuple of :class:`pants.engine.exp.scheduler.LocalScheduler`,
+    :class:`pants.engine.exp.storage.Storage`.
   """
-  symbol_table = {'apache_thrift_java_configuration': ApacheThriftJavaConfiguration,
-                  'apache_thrift_python_configuration': ApacheThriftPythonConfiguration,
-                  'jar': Jar,
-                  'requirement': Requirement,
-                  'scrooge_java_configuration': ScroogeJavaConfiguration,
-                  'scrooge_scala_configuration': ScroogeScalaConfiguration,
-                  'sources': AddressableSources,
-                  'target': Target,
-                  'build_properties': BuildPropertiesConfiguration}
-  json_parser = functools.partial(parse_json, symbol_table=symbol_table)
-  graph = Graph(AddressMapper(build_root=build_root,
-                              build_pattern=r'^BLD.json$',
-                              parser=json_parser))
 
-  planners = Planners([ApacheThriftPlanner(),
-                       BuildPropertiesPlanner(),
-                       GlobalIvyResolvePlanner(),
-                       JavacPlanner(),
-                       ScalacPlanner(),
-                       ScroogePlanner(),
-                       UnpickleableInputsPlanner(),
-                       UnpickleableResultPlanner()])
-  scheduler = LocalScheduler(graph, planners)
-  return graph, scheduler
+  storage = Storage.create(debug=debug)
+
+  symbol_table_cls = ExampleTable
+
+  # Register "literal" subjects required for these tasks.
+  # TODO: Replace with `Subsystems`.
+  address_mapper = AddressMapper(symbol_table_cls=symbol_table_cls,
+                                                  build_pattern=r'^BLD.json$',
+                                                  parser_cls=JsonParser)
+  source_roots = SourceRoots(('src/java','src/scala'))
+  scrooge_tool_address = Address.parse('src/scala/scrooge')
+
+  goals = {
+      'compile': Classpath,
+      # TODO: to allow for running resolve alone, should split out a distinct 'IvyReport' product.
+      'resolve': Classpath,
+      'list': Address,
+      GenGoal.name(): GenGoal,
+      'unpickleable': UnpickleableResult,
+      'ls': Path,
+      'cat': FileContent,
+    }
+  tasks = [
+      # Codegen
+      GenGoal.signature(),
+      (JavaSources,
+       [Select(ThriftSources),
+        SelectVariant(ApacheThriftJavaConfiguration, 'thrift')],
+       gen_apache_thrift),
+      (PythonSources,
+       [Select(ThriftSources),
+        SelectVariant(ApacheThriftPythonConfiguration, 'thrift')],
+       gen_apache_thrift),
+      (ScalaSources,
+       [Select(ThriftSources),
+        SelectVariant(ScroogeScalaConfiguration, 'thrift'),
+        SelectLiteral(scrooge_tool_address, Classpath)],
+       gen_scrooge_thrift),
+      (JavaSources,
+       [Select(ThriftSources),
+        SelectVariant(ScroogeJavaConfiguration, 'thrift'),
+        SelectLiteral(scrooge_tool_address, Classpath)],
+       gen_scrooge_thrift),
+    ] + [
+      # scala dependency inference
+      (ScalaSources,
+       [Select(ScalaInferredDepsSources),
+        SelectDependencies(Address, ImportedJVMPackages)],
+       reify_scala_sources),
+      (ImportedJVMPackages,
+       [SelectProjection(FilesContent, PathGlobs, ('path_globs',), ScalaInferredDepsSources)],
+       extract_scala_imports),
+      (Address,
+       [Select(JVMPackageName),
+        SelectDependencies(AddressFamily, Paths)],
+       select_package_address),
+      (PathGlobs,
+       [Select(JVMPackageName),
+        SelectLiteral(source_roots, SourceRoots)],
+       calculate_package_search_path),
+    ] + [
+      # Remote dependency resolution
+      (Classpath,
+       [Select(Jar)],
+       ivy_resolve),
+      (Jar,
+       [Select(ManagedJar),
+        SelectVariant(ManagedResolve, 'resolve')],
+       select_rev),
+    ] + [
+      # Compilers
+      (Classpath,
+       [Select(ResourceSources)],
+       isolate_resources),
+      (Classpath,
+       [Select(BuildPropertiesConfiguration)],
+       write_name_file),
+      (Classpath,
+       [Select(JavaSources),
+        SelectDependencies(Classpath, JavaSources)],
+       javac),
+      (Classpath,
+       [Select(ScalaSources),
+        SelectDependencies(Classpath, ScalaSources)],
+       scalac),
+    ] + [
+      # TODO
+      (UnpickleableOutput,
+        [],
+        unpickleable_output),
+      (UnpickleableResult,
+       [Select(UnpickleableOutput)],
+       unpickleable_input),
+    ] + (
+      create_graph_tasks(address_mapper, symbol_table_cls)
+    ) + (
+      create_fs_tasks()
+    )
+
+  project_tree = FileSystemProjectTree(build_root)
+  return LocalScheduler(goals, tasks, storage, project_tree, None, GraphValidator(symbol_table_cls)), storage

@@ -8,6 +8,7 @@ from __future__ import (absolute_import, division, generators, nested_scopes, pr
 import json
 import os
 import re
+import subprocess
 
 from twitter.common.collections import maybe_list
 
@@ -27,7 +28,7 @@ class ExportIntegrationTest(ResolveJarsTestMixin, PantsRunIntegrationTest):
   def run_export(self, test_target, workdir, load_libs=False, only_default=False, extra_args=None):
     """Runs ./pants export ... and returns its json output.
 
-    :param string test_target: spec of the target to run on.
+    :param string|list test_target: spec of the targets to run on.
     :param string workdir: working directory to run pants with.
     :param bool load_libs: whether to load external libraries (of any conf).
     :param bool only_default: if loading libraries, whether to only resolve the default conf, or to
@@ -68,7 +69,7 @@ class ExportIntegrationTest(ResolveJarsTestMixin, PantsRunIntegrationTest):
       thrift_target_name = ('examples.src.thrift.org.pantsbuild.example.precipitation'
                             '.precipitation-java')
       codegen_target_regex = os.path.join(os.path.relpath(workdir, get_buildroot()),
-                                          'gen/thrift/[^/:]*/[^/:]*:{0}'.format(thrift_target_name))
+                                          'gen/thrift/[^/]*/[^/:]*/[^/:]*:{0}'.format(thrift_target_name))
       p = re.compile(codegen_target_regex)
       self.assertTrue(any(p.match(target) for target in json_data.get('targets').keys()))
 
@@ -108,6 +109,10 @@ class ExportIntegrationTest(ResolveJarsTestMixin, PantsRunIntegrationTest):
       self.assertTrue('com.typesafe.sbt:incremental-compiler' in foo_target.get('excludes'))
       self.assertTrue('org.pantsbuild' in foo_target.get('excludes'))
 
+  # This test fails when the `PANTS_IVY_CACHE_DIR` is set to something that isn't
+  # the default location.  The set cache_dir likely needs to be plumbed down
+  # to the sub-invocation of pants.
+  # https://github.com/pantsbuild/pants/issues/3126
   def test_export_jar_path(self):
     with self.temporary_workdir() as workdir:
       test_target = 'examples/tests/java/org/pantsbuild/example/usethrift:usethrift'
@@ -148,6 +153,10 @@ class ExportIntegrationTest(ResolveJarsTestMixin, PantsRunIntegrationTest):
       self.assertIsNotNone(scala_lang_lib['sources'])
       self.assertIsNotNone(scala_lang_lib['javadoc'])
 
+  # This test fails when the `PANTS_IVY_CACHE_DIR` is set to something that isn't
+  # the default location.  The set cache_dir likely needs to be plumbed down
+  # to the sub-invocation of pants.
+  # See https://github.com/pantsbuild/pants/issues/3126
   def test_ivy_classifiers(self):
     with self.temporary_workdir() as workdir:
       test_target = 'testprojects/tests/java/org/pantsbuild/testproject/ivyclassifier:ivyclassifier'
@@ -213,16 +222,23 @@ class ExportIntegrationTest(ResolveJarsTestMixin, PantsRunIntegrationTest):
         },
         json_data['jvm_platforms'])
 
+  def test_test_platform(self):
+    with self.temporary_workdir() as workdir:
+      test_target = 'testprojects/tests/java/org/pantsbuild/testproject/testjvms:eight-test-platform'
+      json_data = self.run_export(test_target, workdir)
+      self.assertEquals('java7', json_data['targets'][test_target]['platform'])
+      self.assertEquals('java8', json_data['targets'][test_target]['test_platform'])
+
   def test_intellij_integration(self):
     with self.temporary_workdir() as workdir:
-      targets = ['src/python/::', 'tests/python/pants_test/base::', 'contrib/::']
-      excludes = [
-        '--exclude-target-regexp=.*go/examples.*',
-        '--exclude-target-regexp=.*scrooge/tests/thrift.*',
-        '--exclude-target-regexp=.*spindle/tests/thrift.*',
-        '--exclude-target-regexp=.*spindle/tests/jvm.*'
-      ]
-      json_data = self.run_export(targets, workdir, extra_args=excludes)
+      exported_file = os.path.join(workdir, "export_file.json")
+      p = subprocess.Popen(['build-support/pants-intellij.sh', '--export-output-file=' + exported_file],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+      p.communicate()
+      self.assertEqual(p.returncode, 0)
+
+      with open(exported_file) as data_file:
+        json_data = json.load(data_file)
 
       python_setup = json_data['python_setup']
       self.assertIsNotNone(python_setup)
@@ -234,6 +250,6 @@ class ExportIntegrationTest(ResolveJarsTestMixin, PantsRunIntegrationTest):
       self.assertTrue(os.path.exists(python_setup['interpreters'][default_interpreter]['binary']))
       self.assertTrue(os.path.exists(python_setup['interpreters'][default_interpreter]['chroot']))
 
-      core_target = json_data['targets']['src/python/pants/backend/core:plugin']
-      self.assertIsNotNone(core_target)
-      self.assertEquals(default_interpreter, core_target['python_interpreter'])
+      python_target = json_data['targets']['src/python/pants/backend/python/targets:python']
+      self.assertIsNotNone(python_target)
+      self.assertEquals(default_interpreter, python_target['python_interpreter'])

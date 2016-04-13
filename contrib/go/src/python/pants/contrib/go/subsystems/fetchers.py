@@ -17,7 +17,6 @@ from contextlib import closing, contextmanager
 
 import requests
 from pants.fs.archive import archiver_for_path
-from pants.option.custom_types import dict_option, list_option
 from pants.subsystem.subsystem import Subsystem
 from pants.util.contextutil import temporary_dir, temporary_file
 from pants.util.memo import memoized_method, memoized_property
@@ -70,7 +69,7 @@ class Fetcher(AbstractClass):
 
 
 class Fetchers(Subsystem):
-  """A registry of installed :class:`Fetcher`s."""
+  """A registry of installed remote code fetchers."""
 
   class AdvertisementError(Exception):
     """Indicates an error advertising a :class:`Fetcher`."""
@@ -183,14 +182,14 @@ class Fetchers(Subsystem):
     # match order by placing fetchers at the head of the list to handle special cases before
     # falling through to more general matchers.
     # Tracked at: https://github.com/pantsbuild/pants/issues/2018
-    register('--mapping', metavar='<mapping>', type=dict_option, default=cls._DEFAULT_FETCHERS,
+    register('--mapping', metavar='<mapping>', type=dict, default=cls._DEFAULT_FETCHERS,
              advanced=True,
              help="A mapping from a remote import path matching regex to a fetcher type to use "
                   "to fetch the remote sources.  The regex must match the beginning of the remote "
                   "import path; no '^' anchor is needed, it is assumed.  The Fetcher types are "
-                  "fully qualified class names or else an installed alias for a fetcher type; ie "
-                  "the builtin `contrib.go.subsystems.fetchers.ArchiveFetcher` is aliased as "
-                  "'ArchiveFetcher'.")
+                  "fully qualified class names or else an installed alias for a fetcher type; "
+                  "I.e., the built-in 'contrib.go.subsystems.fetchers.ArchiveFetcher' is aliased "
+                  "as 'ArchiveFetcher'.")
 
   class GetFetcherError(Exception):
     """Indicates an error finding an appropriate Fetcher."""
@@ -296,15 +295,16 @@ class ArchiveFetcher(Fetcher, Subsystem):
       UrlInfo(url_format='https://github.com/golang/\g<repo>/archive/{rev}.tar.gz',
               default_rev='master',
               strip_level=1),
+    r'google\.golang\.org/.*':
+      UrlInfo(url_format='{meta_repo_url}/+archive/{rev}.tar.gz',
+              default_rev='master',
+              strip_level=0),
   }
 
   @classmethod
   def register_options(cls, register):
-    register('--matchers', metavar='<mapping>', type=dict_option,
+    register('--matchers', metavar='<mapping>', type=dict,
              default=cls._DEFAULT_MATCHERS, advanced=True,
-             # NB: The newlines used below are for reading the logical structure here only.
-             # They're converted to a single space by the help formatting and the resulting long
-             # line of help text is simply wrapped.
              help="A mapping from a remote import path matching regex to an UrlInfo struct "
                   "describing how to fetch and unpack a remote import path.  The regex must match "
                   "the beginning of the remote import path (no '^' anchor is needed, it is "
@@ -315,12 +315,11 @@ class ArchiveFetcher(Fetcher, Subsystem):
                   "method and then formatted with the remote import path\'s `rev`, `import_prefix`, "
                   "and `pkg`.\n"
                   "1. The default revision string to use when no `rev` is supplied; ie 'HEAD' or "
-                  "'master' for git.\n"
+                  "'master' for git. "
                   "2. An integer indicating the number of leading path components to strip from "
-                  "files upacked from the archive.\n"
-                  "\n"
-                  "An example configuration that works against github.com is:\n"
-                  "{r'github.com/(?P<user>[^/]+)/(?P<repo>[^/]+)':\n"
+                  "files upacked from the archive. "
+                  "An example configuration that works against github.com is: "
+                  "{r'github.com/(?P<user>[^/]+)/(?P<repo>[^/]+)': "
                   " ('https://github.com/\g<user>/\g<repo>/archive/{rev}.zip', 'master', 1)}")
     register('--buffer-size', metavar='<bytes>', type=int, advanced=True,
              default=10 * 1024,  # 10KB in case jumbo frames are in play.
@@ -328,7 +327,7 @@ class ArchiveFetcher(Fetcher, Subsystem):
                   'disk when downloading an archive.')
     register('--retries', default=1, advanced=True,
              help='How many times to retry to fetch a remote library.')
-    register('--prefixes', metavar='<paths>', type=list_option, advanced=True,
+    register('--prefixes', metavar='<paths>', type=list, advanced=True,
              fromfile=True, default=[],
              help="Known import-prefixes for go packages")
 
@@ -365,11 +364,12 @@ class ArchiveFetcher(Fetcher, Subsystem):
     match, _ = self._matcher(import_path)
     return match.string[:match.end()]
 
-  def fetch(self, import_path, dest, rev=None):
+  def fetch(self, import_path, dest, rev=None, url_info=None, meta_repo_url=None):
     match, url_info = self._matcher(import_path)
     pkg = GoRemoteLibrary.remote_package_path(self.root(import_path), import_path)
     archive_url = match.expand(url_info.url_format).format(
-      rev=url_info.rev(rev), pkg=pkg, import_prefix=self.root(import_path))
+      rev=url_info.rev(rev), pkg=pkg, import_prefix=self.root(import_path),
+      meta_repo_url=meta_repo_url)
     try:
       archiver = archiver_for_path(archive_url)
     except ValueError:
@@ -456,7 +456,7 @@ class GopkgInFetcher(Fetcher, Subsystem):
   def _do_fetch(self, import_path, dest, rev=None):
     return self._fetcher.fetch(import_path, dest, rev=rev)
 
-  def fetch(self, import_path, dest, rev=None):
+  def fetch(self, import_path, dest, rev=None, meta_repo_url=None):
     github_root, github_rev = self._map_github_root_and_rev(import_path, rev)
     self._do_fetch(github_root, dest, rev=rev or github_rev)
 
@@ -607,3 +607,4 @@ Fetchers.advertise(ArchiveFetcher, namespace='')
 Fetchers._register_default(r'bitbucket\.org/.*', ArchiveFetcher)
 Fetchers._register_default(r'github\.com/.*', ArchiveFetcher)
 Fetchers._register_default(r'golang\.org/x/.*', ArchiveFetcher)
+Fetchers._register_default(r'google\.golang\.org/.*', ArchiveFetcher)

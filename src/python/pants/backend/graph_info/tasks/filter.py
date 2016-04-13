@@ -31,34 +31,35 @@ class Filter(TargetFilterTaskMixin, ConsoleTask):
   @classmethod
   def register_options(cls, register):
     super(Filter, cls).register_options(register)
-    register('--type', action='append', metavar='[+-]type1,type2,...',
+    register('--type', type=list, metavar='[+-]type1,type2,...',
              help='Filter on these target types.')
-    register('--target', action='append', metavar='[+-]spec1,spec2,...',
+    register('--target', type=list, metavar='[+-]spec1,spec2,...',
              help='Filter on these target addresses.')
-    register('--ancestor', action='append', metavar='[+-]spec1,spec2,...',
+    register('--ancestor', type=list, metavar='[+-]spec1,spec2,...',
              help='Filter on targets that these targets depend on.')
-    register('--regex', action='append', metavar='[+-]regex1,regex2,...',
+    register('--regex', type=list, metavar='[+-]regex1,regex2,...',
              help='Filter on target addresses matching these regexes.')
-    register('--tag-regex', action='append', metavar='[+-]regex1,regex2,...',
+    register('--tag-regex', type=list, metavar='[+-]regex1,regex2,...',
              help='Filter on targets with tags matching these regexes.')
 
   def __init__(self, *args, **kwargs):
     super(Filter, self).__init__(*args, **kwargs)
     self._filters = []
 
-    def _get_targets(spec):
+    def _get_targets(spec_str):
+      spec_parser = CmdLineSpecParser(get_buildroot())
       try:
-        spec_parser = CmdLineSpecParser(get_buildroot(), self.context.address_mapper)
-        addresses = spec_parser.parse_addresses(spec)
+        spec = spec_parser.parse_spec(spec_str)
+        addresses = self.context.address_mapper.scan_specs([spec])
       except AddressLookupError as e:
-        raise TaskError('Failed to parse address selector: {spec}\n {message}'.format(spec=spec, message=e))
+        raise TaskError('Failed to parse address selector: {spec_str}\n {message}'.format(spec_str=spec_str, message=e))
       # filter specs may not have been parsed as part of the context: force parsing
       matches = set()
       for address in addresses:
         self.context.build_graph.inject_address_closure(address)
         matches.add(self.context.build_graph.get_target(address))
       if not matches:
-        raise TaskError('No matches for address selector: {spec}'.format(spec=spec))
+        raise TaskError('No matches for address selector: {spec_str}'.format(spec_str=spec_str))
       return matches
 
     def filter_for_address(spec):

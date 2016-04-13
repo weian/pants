@@ -1,8 +1,9 @@
-Created by running `./build-support/bin/contributors.sh`.
+Created by running `build-support/bin/contributors.sh`.
 
 + Alan Paulin
 + Alexander Johnson
 + Alyssa Pohahau
++ Andrew Hamilton
 + Andy Reitz
 + Antoine Tollenaere
 + Benjy Weinberger
@@ -12,10 +13,12 @@ Created by running `./build-support/bin/contributors.sh`.
 + Chris Aniszczyk
 + Chris Burroughs
 + Chris Chen
++ Chris Heisterkamp
 + Chris Pesto
 + Cody Gibb
 + Craig Schertz
 + Dan Davydov
++ Dan Fabulich
 + Dan Harrison
 + Daniel Anderson
 + Daniel Bentley
@@ -24,6 +27,7 @@ Created by running `./build-support/bin/contributors.sh`.
 + Divij Rajkumar
 + Dominic Hamon
 + Dumitru Daniliuc
++ Emily Caveness
 + Eric Ayers
 + Eric Danielson
 + Eric Lindvall

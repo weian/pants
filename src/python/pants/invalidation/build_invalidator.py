@@ -20,11 +20,10 @@ from pants.util.dirutil import safe_mkdir
 #  - id identifies the set of targets.
 #  - hash is a fingerprint of all invalidating inputs to the build step, i.e., it uniquely
 #    determines a given version of the artifacts created when building the target set.
-#  - num_chunking_units: The number of "units" of chunking the payloads together contribute
 #    to the chunking algorithm.  Right now this is used to count the number of source files
 #    in a scala target set for breaking up zinc invocations.
 
-CacheKey = namedtuple('CacheKey', ['id', 'hash', 'num_chunking_units'])
+CacheKey = namedtuple('CacheKey', ['id', 'hash'])
 
 
 # Bump this to invalidate all existing keys in artifact caches across all pants deployments in the
@@ -34,7 +33,10 @@ GLOBAL_CACHE_KEY_GEN_VERSION = '7'
 
 
 class CacheKeyGenerator(object):
-  """Generates cache keys for versions of target sets."""
+  """Generates cache keys for versions of target sets.
+
+  :API: public
+  """
 
   @staticmethod
   def combine_cache_keys(cache_keys):
@@ -46,19 +48,22 @@ class CacheKeyGenerator(object):
     Note that this operation is commutative but not associative.  We use the term 'combine' rather
     than 'merge' or 'union' to remind the user of this. Associativity is not a necessary property,
     in practice.
+
+    :API: public
     """
     if len(cache_keys) == 1:
       return cache_keys[0]
     else:
       combined_id = Target.maybe_readable_combine_ids(cache_key.id for cache_key in cache_keys)
       combined_hash = hash_all(sorted(cache_key.hash for cache_key in cache_keys))
-      summed_chunking_units = sum([cache_key.num_chunking_units for cache_key in cache_keys])
-      return CacheKey(combined_id, combined_hash, summed_chunking_units)
+      return CacheKey(combined_id, combined_hash)
 
   def __init__(self, cache_key_gen_version=None):
     """
     cache_key_gen_version - If provided, added to all cache keys. Allows you to invalidate
       all cache keys in a single pants repo, by changing this value in config.
+
+    :API: public
     """
 
     self._cache_key_gen_version = '_'.join([cache_key_gen_version or '',
@@ -69,6 +74,8 @@ class CacheKeyGenerator(object):
 
     A key for a set of targets can be created by calling combine_cache_keys()
     on the target's individual cache keys.
+
+    :API: public
 
     :target: The target to create a CacheKey for.
     :transitive: Whether or not to include a fingerprint of all of :target:'s dependencies.
@@ -85,7 +92,7 @@ class CacheKeyGenerator(object):
       target_key = target.invalidation_hash(fingerprint_strategy)
     if target_key is not None:
       full_key = '{target_key}_{key_suffix}'.format(target_key=target_key, key_suffix=key_suffix)
-      return CacheKey(target.id, full_key, target.num_chunking_units)
+      return CacheKey(target.id, full_key)
     else:
       return None
 
@@ -103,16 +110,20 @@ class BuildInvalidator(object):
   def previous_key(self, cache_key):
     """If there was a previous successful build for the given key, return the previous key.
 
+    :API: public
+
     :param cache_key: A CacheKey object (as returned by CacheKeyGenerator.key_for().
     :returns: The previous cache_key, or None if there was not a previous build.
     """
     previous_hash = self._read_sha(cache_key)
     if not previous_hash:
       return None
-    return CacheKey(cache_key.id, previous_hash, cache_key.num_chunking_units)
+    return CacheKey(cache_key.id, previous_hash)
 
   def needs_update(self, cache_key):
     """Check if the given cached item is invalid.
+
+    :API: public
 
     :param cache_key: A CacheKey object (as returned by CacheKeyGenerator.key_for().
     :returns: True if the cached version of the item is out of date.
@@ -122,16 +133,24 @@ class BuildInvalidator(object):
   def update(self, cache_key):
     """Makes cache_key the valid version of the corresponding target set.
 
+    :API: public
+
     :param cache_key: A CacheKey object (typically returned by CacheKeyGenerator.key_for()).
     """
     self._write_sha(cache_key)
 
   def force_invalidate_all(self):
-    """Force-invalidates all cached items."""
+    """Force-invalidates all cached items.
+
+    :API: public
+    """
     safe_mkdir(self._root, clean=True)
 
   def force_invalidate(self, cache_key):
-    """Force-invalidate the cached item."""
+    """Force-invalidate the cached item.
+
+    :API: public
+    """
     try:
       os.unlink(self._sha_file(cache_key))
     except OSError as e:

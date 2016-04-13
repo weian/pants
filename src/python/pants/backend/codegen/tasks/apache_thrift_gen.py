@@ -20,7 +20,6 @@ from pants.base.build_environment import get_buildroot
 from pants.base.exceptions import TaskError
 from pants.base.workunit import WorkUnitLabel
 from pants.binaries.thrift_binary import ThriftBinary
-from pants.option.custom_types import list_option
 from pants.util.memo import memoized_property
 
 
@@ -33,14 +32,14 @@ class ApacheThriftGen(SimpleCodegenTask):
     # NB: As of thrift 0.9.2 there is 1 warning that -strict promotes to an error - missing a
     # struct field id.  If an artifact was cached with strict off, we must re-gen with strict on
     # since this case may be present and need to generate a thrift compile error.
-    register('--strict', default=True, fingerprint=True, action='store_true',
+    register('--strict', default=True, fingerprint=True, type=bool,
              help='Run thrift compiler with strict warnings.')
 
     register('--gen-options', advanced=True, fingerprint=True,
              help='Use these apache thrift java gen options.')
-    register('--deps', advanced=True, type=list_option,
+    register('--deps', advanced=True, type=list,
              help='A list of specs pointing to dependencies of thrift generated java code.')
-    register('--service-deps', advanced=True, type=list_option,
+    register('--service-deps', advanced=True, type=list,
              help='A list of specs pointing to dependencies of thrift generated java service '
                   'code.  If not supplied, then --deps will be used for service deps.')
 
@@ -139,3 +138,8 @@ class ApacheThriftGen(SimpleCodegenTask):
 
   def execute_codegen(self, target, target_workdir):
     self._generate_thrift(target, target_workdir)
+
+  @property
+  def _copy_target_attributes(self):
+    """Propagate the provides attribute to the synthetic java_library() target for publishing."""
+    return ['provides']

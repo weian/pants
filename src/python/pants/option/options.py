@@ -10,6 +10,7 @@ import sys
 
 from pants.option.arg_splitter import GLOBAL_SCOPE, ArgSplitter
 from pants.option.global_options import GlobalOptionsRegistrar
+from pants.option.option_util import is_list_option
 from pants.option.option_value_container import OptionValueContainer
 from pants.option.parser_hierarchy import ParserHierarchy, enclosing_scope
 from pants.option.scope import ScopeInfo
@@ -25,9 +26,9 @@ class Options(object):
   The value in global scope of option '--foo-bar' (registered in global scope) will be selected
   in the following order:
     - The value of the --foo-bar flag in global scope.
-    - The value of the PANTS_DEFAULT_FOO_BAR environment variable.
+    - The value of the PANTS_GLOBAL_FOO_BAR environment variable.
     - The value of the PANTS_FOO_BAR environment variable.
-    - The value of the foo_bar key in the [DEFAULT] section of pants.ini.
+    - The value of the foo_bar key in the [GLOBAL] section of pants.ini.
     - The hard-coded value provided at registration time.
     - None.
 
@@ -38,11 +39,11 @@ class Options(object):
     - The value of the --foo-bar flag in global scope.
     - The value of the PANTS_COMPILE_JAVA_FOO_BAR environment variable.
     - The value of the PANTS_COMPILE_FOO_BAR environment variable.
-    - The value of the PANTS_DEFAULT_FOO_BAR environment variable.
+    - The value of the PANTS_GLOBAL_FOO_BAR environment variable.
     - The value of the PANTS_FOO_BAR environment variable.
     - The value of the foo_bar key in the [compile.java] section of pants.ini.
     - The value of the foo_bar key in the [compile] section of pants.ini.
-    - The value of the foo_bar key in the [DEFAULT] section of pants.ini.
+    - The value of the foo_bar key in the [GLOBAL] section of pants.ini.
     - The hard-coded value provided at registration time.
     - None.
 
@@ -54,7 +55,7 @@ class Options(object):
     - The value of the PANTS_COMPILE_FOO_BAR environment variable.
     - The value of the foo_bar key in the [compile.java] section of pants.ini.
     - The value of the foo_bar key in the [compile] section of pants.ini.
-    - The value of the foo_bar key in the [DEFAULT] section of pants.ini
+    - The value of the foo_bar key in the [GLOBAL] section of pants.ini
       (because of automatic config file fallback to that section).
     - The hard-coded value provided at registration time.
     - None.
@@ -88,7 +89,7 @@ class Options(object):
     """Create an Options instance.
 
     :param env: a dict of environment variables.
-    :param config: data from a config file (must support config.get[list](section, name, default=)).
+    :param :class:`pants.option.config.Config` config: data from a config file.
     :param known_scope_infos: ScopeInfos for all scopes that may be encountered.
     :param args: a list of cmd-line args; defaults to `sys.argv` if None is supplied.
     :param bootstrap_option_values: An optional namespace containing the values of bootstrap
@@ -148,16 +149,25 @@ class Options(object):
 
   @property
   def help_request(self):
+    """
+    :API: public
+    """
     return self._help_request
 
   @property
   def target_specs(self):
-    """The targets to operate on."""
+    """The targets to operate on.
+
+    :API: public
+    """
     return self._target_specs
 
   @property
   def goals(self):
-    """The requested goals, in the order specified on the cmd line."""
+    """The requested goals, in the order specified on the cmd line.
+
+    :API: public
+    """
     return self._goals
 
   @property
@@ -191,7 +201,10 @@ class Options(object):
                    self._option_tracker)
 
   def is_known_scope(self, scope):
-    """Whether the given scope is known by this instance."""
+    """Whether the given scope is known by this instance.
+
+    :API: public
+    """
     return scope in self._known_scope_to_info
 
   def passthru_args_for_scope(self, scope):
@@ -244,6 +257,8 @@ class Options(object):
 
     Values are attributes of the returned object, e.g., options.foo.
     Computed lazily per scope.
+
+    :API: public
     """
     # Short-circuit, if already computed.
     if scope in self._values_by_scope:
@@ -268,6 +283,8 @@ class Options(object):
     """Returns a list of fingerprintable (option type, option value) pairs for the given scope.
 
     Fingerprintable options are options registered via a "fingerprint=True" kwarg.
+
+    :API: public
     """
     pairs = []
     # Note that we iterate over options registered at `scope` and at all enclosing scopes, since
@@ -286,7 +303,11 @@ class Options(object):
         # scope, to get the right value for recursive options (and because this mirrors what
         # option-using code does).
         val = self.for_scope(scope)[kwargs['dest']]
-        val_type = kwargs.get('type', '')
+        # If we have a list then we delegate to the fingerprinting implementation of the members.
+        if is_list_option(kwargs):
+          val_type = kwargs.get('member_type', str)
+        else:
+          val_type = kwargs.get('type', str)
         pairs.append((val_type, val))
       registration_scope = (None if registration_scope == ''
                             else enclosing_scope(registration_scope))
@@ -306,5 +327,8 @@ class Options(object):
     return self._bootstrap_option_values
 
   def for_global_scope(self):
-    """Return the option values for the global scope."""
+    """Return the option values for the global scope.
+
+    :API: public
+    """
     return self.for_scope(GLOBAL_SCOPE)

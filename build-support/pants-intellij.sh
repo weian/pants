@@ -5,7 +5,9 @@
 
 # We don't want to include targets which are used in unit tests in our project so let's exclude them.
 ./pants export src/python/:: tests/python/pants_test:: contrib/:: \
+    --exclude-target-regexp='.*android.*' \
     --exclude-target-regexp='.*go/examples.*' \
     --exclude-target-regexp='.*scrooge/tests/thrift.*' \
     --exclude-target-regexp='.*spindle/tests/thrift.*' \
-    --exclude-target-regexp='.*spindle/tests/jvm.*'
+    --exclude-target-regexp='.*spindle/tests/jvm.*' \
+    "$@"

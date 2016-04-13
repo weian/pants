@@ -11,15 +11,16 @@ and not worry about these things.)
 Configuring with `pants.ini`
 ----------------------------
 
-Pants Build is very configurable. Your source tree's top-level directory
-contains a `pants.ini` file that can set various options,
-specify binaries to
-use in your toolchain, set arguments to pass to tools, etc.
+Pants is very configurable and has literally hundreds of options.  Most of these are 
+automatically set to useful defaults. However it is inevitable that sooner or later you'll 
+need to tweak some of them.  For example, you may want to use `pants.ini`
+[[to pin your Pants version|pants('src/docs:install')]]
 
-This file is a [Python config
-files](http://docs.python.org/install/index.html#inst-config-syntax),
-parsed by
-[ConfigParser](http://docs.python.org/library/configparser.html). Thus,
+To do so, create a `pants.ini` file in your source tree's top-level directory.  If you installed
+pants [[as recommended|pants('src/docs:install')]] this file should already exist.
+
+The `pants.ini` file is a [Python config files](http://docs.python.org/install/index.html#inst-config-syntax),
+parsed by [ConfigParser](http://docs.python.org/library/configparser.html). Thus,
 it looks something like:
 
     :::ini
@@ -35,6 +36,9 @@ several contexts, as in these excerpts that define/use `thrift_workdir`:
     [DEFAULT]
     thrift_workdir: %(pants_workdir)s/thrift
 
+    [GLOBAL]
+    print_exception_stacktrace: True
+
     [gen.thrift]
     workdir: %(thrift_workdir)s
 
@@ -44,20 +48,34 @@ several contexts, as in these excerpts that define/use `thrift_workdir`:
     ]
 
 It's also handy for defining values that are used in several contexts,
-since these values will be available in all those contexts. The code
-that combines DEFAULT values with others is in Pants'
-[option/config.py](https://github.com/pantsbuild/pants/blob/master/src/python/pants/option/config.py).
+since these values will be available in all those contexts. 
 
 Configure Pants' own Runtime Dependencies
 -----------------------------------------
 
 Pants calls out to other tools. E.g., it optionally uses `scalastyle` to check scala source code.
-Most tools come pre-configured by Pants. A few do require more setup though and these rely on
-special targets in your workspace to specify versions of the tools to fetch. These targets all live
-in the `BUILD.tools` file by convention. For example, when Pants fetches `scalastyle`, it looks in
-`BUILD.tools` for that target:
+Most tools come pre-configured by Pants. If you use scala a few tools are configured based on the
+major scala version provided with the --version flag.  You can specify custom tool versions by
+passing "custom" to --scala-platform-version. If a custom version of scala is desired some of these
+tools require more setup though and these rely on special targets in your workspace to specify
+versions of the tools to fetch .These targets all live in the `BUILD.tools` file by convention.
 
-!inc[start-at=scalastyle&end-before=scrooge-gen](../../BUILD.tools)
+For example, the following targets are used to provide custom scala tools:
+
+`//:scalastyle`: Scala style checking.
+`//:scalac`: Scala compiler.
+`//:scala-repl`: Scala REPL environment.
+`//:scala-library`: Scala runtime environment.
+
+Pants looks in `BUILD.tools` for that target.  Below is an example of BUILD.tools that overrides
+the default minor version for 2.10.  For these changes to take effect you would need to set
+--scala-platform-version to 'custom'.
+
+!inc(../../testprojects/src/scala/org/pantsbuild/testproject/scalac/plugin/custom_211_scalatools.build)
+
+Additional tools can be defined as follows in BUILD.tools:
+
+!inc[start-at=scala-js-library&end-before=scrooge-gen](../../BUILD.tools)
 
 When setting up your Pants repo, you may want to copy this file over from a working Pants repo and
 perhaps change some version numbers to fit your situation.
@@ -199,11 +217,14 @@ In your `pants.ini` file, set up a `[publish.jar]` section. In that section,
 create a `dict` called `repos`. It should contain a section for each `Repository` object that you
 defined in your plugin:
 
+    :::ini
+    [publish.jar]
     repos: {
       'public': {  # must match the name of the `Repository` object that you defined in your plugin.
         'resolver': 'maven.example.com', # must match hostname in ~/.netrc and the <url> parameter
                                          # in your custom ivysettings.xml.
-        'auth': 'build-support:netrc',   # Pants spec to a 'credentials()' object.
+        'auth': 'build-support:netrc',   # Pants spec to a 'credentials()' or
+                                         # 'netrc_credentials()' object.
         'help': 'Configure your ~/.netrc for maven.example.com access.'
       },
       'testing': {
@@ -227,34 +248,38 @@ matches the `repos` specified above:
 And place the following in a `BUILD` file somewhere in your repository (`build-support/BUILD` is a
 good place, and is used in the example above):
 
-    netrc = netrc()
-
-    credentials(
-      name = 'netrc',
-      username=netrc.getusername,
-      password=netrc.getpassword)
+    netrc_credentials(name = 'netrc')
 
 Next, tell Ivy how to publish to your repository. Add a new `ivysettings.xml` file to your repo
 with the additional information needed to publish artifacts. Here is an example to get you started:
 
-   :::xml
+    :::xml
     <?xml version="1.0"?>
 
     <ivysettings>
       <settings defaultResolver="chain-repos"/>
+      <!-- The ${login} and ${password} values come from a netrc_credentials() object in a BUILD
+           file, which is fed by '~/.netrc'.  There must be a '~/.netrc' machine entry which
+           matches a resolver in the "repos" object in 'pants.ini', which also matches the 'host' in
+           this XML block.
 
+           machine <hostname>
+             login <login>
+             password <password>
+
+           The realm must match the kind of repository you are publishing to. For Sonotype Nexus, use:
+
+           realm="Sonatype Nexus Repository Manager"
+
+        -->
       <credentials host="artifactory.example.com"
                    realm="Artifactory Realm"
-                   <!-- These values come from a credentials() object, which is fed by '~/.netrc'.
-                        There must be a '~/.netrc' machine entry which matches a resolver in the
-                        "repos" object in 'pants.ini', which also matches the 'host' in this XML
-                        block. -->
                    username="${login}"
                    passwd="${password}"/>
 
       <resolvers>
         <chain name="chain-repos" returnFirst="true">
-           <ibiblio name="corp-maven"
+           <ibiblio name="artifactory.example.com"
                          m2compatible="true"
                          usepoms="true"
                          root="https://artifactory.example.com/content/groups/public/"/>
@@ -266,9 +291,11 @@ with the additional information needed to publish artifacts. Here is an example 
       </resolvers>
     </ivysettings>
 
-With this file in place, add a `[publish]` section to `pants.ini`, and tell pants to use
+With this file in place, add a `[publish.jar]` section to `pants.ini`, and tell pants to use
 the custom Ivy settings when publishing:
 
+    :::ini
+    [publish.jar]
     ivy_settings: %(pants_supportdir)s/ivy/ivysettings_for_publishing.xml
 
 <a pantsmark="setup_publish_restrict_branch"> </a>
@@ -308,7 +335,7 @@ and having set up such a server, set `cache` options in `pants.ini`:
 When building, Pants first tries to read built things from places in `read_from`.
 If it builds something, it caches those built things in places in  `write_to`.
 (It's handy that these are separate settings; if members of your organization can install wacky
-tools on their laptops, you might not want their builds to write to a particular cache, but would 
+tools on their laptops, you might not want their builds to write to a particular cache, but would
 want them to be able to read from it.)
 
 Valid option values include
@@ -345,7 +372,7 @@ If you you work with a large engineering organization, you might want to
 gather this information in one place, so it can inform decisions about how
 to improve everybody's build times.
 
-In everyone's `pants.ini` files, in the `[DEFAULT]` section, add a
+In everyone's `pants.ini` files, in the `[run-tracker]` section, add a
 `stats_upload_url` line:
 
     stats_upload_url: "http://myorg.org/pantsstats"

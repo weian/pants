@@ -2,6 +2,8 @@
 # Copyright 2014 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
+set -eo pipefail
+
 REPO_ROOT=$(cd $(dirname "${BASH_SOURCE[0]}") && cd "$(git rev-parse --show-toplevel)" && pwd)
 
 source ${REPO_ROOT}/build-support/common.sh
@@ -38,8 +40,13 @@ while getopts "hopyd:" opt; do
   esac
 done
 
-${PANTS_EXE} builddict --omit-impl-re='internal_backend.*' || \
-  die "Failed to generate the 'BUILD Dictionary' and/or 'Options Reference'."
+# TODO(benjy): Instead of invoking Pants multiple times, these actions should be chained using
+# products, like everything else.
+
+${PANTS_EXE} reference \
+  --pants-reference-template=reference/pants_reference_body.html \
+  --build-dictionary-template=reference/build_dictionary_body.html \
+  || die "Failed to generate the reference and/or build dictionary documents."
 
 function do_open() {
   if [[ "${preview}" = "true" ]]; then
@@ -59,6 +66,7 @@ ${PANTS_EXE} markdown --fragment \
   testprojects/src/java/org/pantsbuild/testproject/page:readme || \
     die "Failed to generate HTML from markdown'."
 
+
 # invoke doc site generator.
 ${PANTS_EXE} sitegen --config-path=src/python/pants/docs/docsite.json || \
   die "Failed to generate doc site'."
@@ -73,7 +81,7 @@ continue."
   fi
   (
     ${REPO_ROOT}/src/python/pants/docs/publish_via_git.sh \
-      git@github.com:pantsbuild/pantsbuild.github.io.git \
+      https://github.com/pantsbuild/pantsbuild.github.io.git \
       ${publish_path} && \
     do_open ${url}/index.html
   ) || die "Publish to ${url} failed."

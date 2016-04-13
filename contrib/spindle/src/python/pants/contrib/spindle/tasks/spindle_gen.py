@@ -16,7 +16,6 @@ from pants.backend.jvm.tasks.nailgun_task import NailgunTask
 from pants.base.build_environment import get_buildroot
 from pants.base.exceptions import TaskError
 from pants.build_graph.address import Address
-from pants.option.custom_types import list_option
 from twitter.common.dirutil import safe_mkdir
 
 from pants.contrib.spindle.targets.spindle_thrift_library import SpindleThriftLibrary
@@ -33,17 +32,10 @@ class SpindleGen(NailgunTask):
   def register_options(cls, register):
     super(SpindleGen, cls).register_options(register)
     register(
-      '--jvm-options',
-      default=[],
-      advanced=True,
-      type=list_option,
-      help='Use these jvm options when running Spindle.',
-    )
-    register(
       '--runtime-dependency',
       default=['3rdparty:spindle-runtime'],
       advanced=True,
-      type=list_option,
+      type=list,
       help='A list of targets that all spindle codegen depends on at runtime.',
     )
     cls.register_jvm_tool(register,
@@ -111,7 +103,7 @@ class SpindleGen(NailgunTask):
     targets = self.codegen_targets()
     build_graph = self.context.build_graph
     with self.invalidated(targets, invalidate_dependents=True) as invalidation_check:
-      for vts in invalidation_check.invalid_vts_partitioned:
+      for vts in invalidation_check.invalid_vts:
         invalid_targets = vts.targets
         self.execute_codegen(invalid_targets)
 
@@ -229,7 +221,6 @@ def calculate_genfiles(source):
       namespace = match.group(2)
       namespaces[lang] = namespace
 
-  genfiles = defaultdict(set)
   namespace = namespaces.get('java')
 
   if not namespace:

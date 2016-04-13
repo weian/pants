@@ -156,15 +156,15 @@ class GoBuildgen(GoTask):
 
   @classmethod
   def register_options(cls, register):
-    register('--remote', action='store_true', advanced=True, fingerprint=True,
+    register('--remote', type=bool, advanced=True, fingerprint=True,
              help='Allow auto-generation of remote dependencies without pinned versions '
                   '(FLOATING versions).')
 
-    register('--fail-floating', action='store_true', advanced=True, fingerprint=True,
+    register('--fail-floating', type=bool, advanced=True, fingerprint=True,
              help='After generating all dependencies, fail if any newly generated or pre-existing '
                   'dependencies have un-pinned - aka FLOATING - versions.')
 
-    register('--materialize', action='store_true', advanced=True, fingerprint=True,
+    register('--materialize', type=bool, advanced=True, fingerprint=True,
              help='Instead of just auto-generating missing go_binary and go_library targets in '
                   'memory, (re-)generate them on disk using the installed Go BUILD file template.')
 
@@ -248,9 +248,7 @@ class GoBuildgen(GoTask):
 
     def gather_go_buildfiles(rel_path):
       address_mapper = self.context.address_mapper
-      for build_file in address_mapper.scan_buildfiles(root_dir=get_buildroot(),
-                                                       base_path=rel_path,
-                                                       spec_excludes=self.context.spec_excludes):
+      for build_file in address_mapper.scan_build_files(base_path=rel_path):
         existing_go_buildfiles.add(build_file.relpath)
 
     gather_go_buildfiles(generation_result.local_root)
