@@ -75,10 +75,14 @@ python_tests(
   sources = ['test_bundle_create.py'],
   dependencies = [
     ':jvm_binary_task_test_base',
+    'src/python/pants/backend/jvm/targets:java',
     'src/python/pants/backend/jvm/targets:jvm',
     'src/python/pants/backend/jvm/tasks:bundle_create',
+    'src/python/pants/backend/jvm/tasks:classpath_util',
     'src/python/pants/backend/jvm:jar_dependency_utils',
+    'src/python/pants/build_graph',
     'src/python/pants/util:contextutil',
+    'src/python/pants/util:dirutil',
   ]
 )
 
@@ -218,10 +222,12 @@ python_tests(
     'src/python/pants/backend/jvm/tasks:ivy_resolve',
     'src/python/pants/backend/jvm/tasks:ivy_task_mixin',
     'src/python/pants/backend/jvm:ivy_utils',
+    'src/python/pants/task',
     'src/python/pants/util:contextutil',
     'tests/python/pants_test/jvm:jvm_tool_task_test_base',
     'tests/python/pants_test/subsystem:subsystem_utils',
     'tests/python/pants_test:base_test',
+    'tests/python/pants_test/tasks:task_test_base',
   ]
 )
 
@@ -359,6 +365,18 @@ python_tests(
     'tests/python/pants_test:int-test',
   ],
   tags = {'integration'},
+  timeout = 240,
+)
+
+python_tests(
+  name = 'junit_tests_concurrency_integration',
+  sources = ['test_junit_tests_concurrency_integration.py'],
+  dependencies = [
+    'src/python/pants/util:contextutil',
+    'tests/python/pants_test:int-test',
+  ],
+  tags = {'integration'},
+  timeout = 240,
 )
 
 python_library(
@@ -466,6 +484,7 @@ python_tests(
   name = 'jvm_run',
   sources = ['test_jvm_run.py'],
   dependencies = [
+    'src/python/pants/backend/jvm/subsystems:jvm',
     'src/python/pants/backend/jvm/targets:jvm',
     'src/python/pants/backend/jvm/tasks:jvm_run',
     'src/python/pants/util:contextutil',
@@ -562,6 +581,7 @@ python_tests(
   dependencies = [
     'tests/python/pants_test:int-test',
   ],
+  timeout=300,
   tags = {'integration'},
 )
 

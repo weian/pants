@@ -3,6 +3,7 @@
 
 package org.pantsbuild.tools.junit.impl;
 
+import com.google.common.annotations.VisibleForTesting;
 import java.io.File;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
@@ -334,7 +335,7 @@ public class ConsoleRunnerImpl {
   private final boolean xmlReport;
   private final File outdir;
   private final boolean perTestTimer;
-  private final boolean defaultParallel;
+  private final Concurrency defaultConcurrency;
   private final int parallelThreads;
   private final int testShard;
   private final int numTestShards;
@@ -348,7 +349,7 @@ public class ConsoleRunnerImpl {
       boolean xmlReport,
       boolean perTestTimer,
       File outdir,
-      boolean defaultParallel,
+      Concurrency defaultConcurrency,
       int parallelThreads,
       int testShard,
       int numTestShards,
@@ -356,12 +357,17 @@ public class ConsoleRunnerImpl {
       PrintStream out,
       PrintStream err) {
 
+    Preconditions.checkNotNull(outputMode);
+    Preconditions.checkNotNull(defaultConcurrency);
+    Preconditions.checkNotNull(out);
+    Preconditions.checkNotNull(err);
+
     this.failFast = failFast;
     this.outputMode = outputMode;
     this.xmlReport = xmlReport;
     this.perTestTimer = perTestTimer;
     this.outdir = outdir;
-    this.defaultParallel = defaultParallel;
+    this.defaultConcurrency = defaultConcurrency;
     this.parallelThreads = parallelThreads;
     this.testShard = testShard;
     this.numTestShards = numTestShards;
@@ -422,7 +428,7 @@ public class ConsoleRunnerImpl {
     try {
       if (this.parallelThreads > 1) {
         ConcurrentCompositeRequest request = new ConcurrentCompositeRequest(
-            requests, this.defaultParallel, this.parallelThreads);
+            requests, this.defaultConcurrency, this.parallelThreads);
         failures = core.run(request).getFailureCount();
       } else {
         for (Request request : requests) {
@@ -513,12 +519,20 @@ public class ConsoleRunnerImpl {
     if (!classes.isEmpty()) {
       if (this.perTestTimer || this.parallelThreads > 1) {
         for (Class<?> clazz : classes) {
-          requests.add(new AnnotatedClassRequest(clazz, numRetries, err));
+          if (this.shouldRunParallelMethods(clazz)) {
+            // Don't add these as class requests, make individual TestMethod requests.
+            for (Method method :
+                Iterables.filter(Arrays.asList(clazz.getMethods()),IS_ANNOTATED_TEST_METHOD)) {
+              testMethods.add(new TestMethod(clazz, method.getName()));
+            }
+          } else {
+            requests.add(new AnnotatedClassRequest(clazz, numRetries, err));
+          }
         }
       } else {
         // The code below does what the original call
         // requests.add(Request.classes(classes.toArray(new Class<?>[classes.size()])));
-        // does, except that it instantiates our own builder, needed to support retries
+        // does, except that it instantiates our own builder, needed to support retries.
         try {
           AllDefaultPossibilitiesBuilderWithRetry builder =
               new AllDefaultPossibilitiesBuilderWithRetry(numRetries, err);
@@ -536,6 +550,11 @@ public class ConsoleRunnerImpl {
           .filterWith(Description.createTestDescription(testMethod.clazz, testMethod.name)));
     }
     return requests;
+  }
+
+  private boolean shouldRunParallelMethods(Class<?> clazz) {
+    // TODO(zundel): Add support for an annotation like TestParallelMethods.
+    return this.defaultConcurrency.shouldRunMethodsParallel();
   }
 
   // Loads classes without initializing them.  We just need the type, annotations and method
@@ -608,7 +627,8 @@ public class ConsoleRunnerImpl {
 
   private void notFoundError(String spec, PrintStream out, Throwable t) {
     out.printf("FATAL: Error during test discovery for %s: %s\n", spec, t);
-    throw new RuntimeException("Classloading error during test discovery for " + spec, t);
+    throw new RuntimeException(
+        "Classloading error during test discovery for spec '%s'".format(spec), t);
   }
 
   /**
@@ -641,9 +661,20 @@ public class ConsoleRunnerImpl {
           usage = "Show a description of each test and timer for each test class.")
       private boolean perTestTimer;
 
+      // TODO(zundel): Combine -default-parallel and -paralel-methods together into a
+      // single argument:  -default-concurrency {serial, parallel, parallel_methods}
+      // TODO(zundel): Also add a @TestParallelMethods annotation
       @Option(name = "-default-parallel",
           usage = "Whether to run test classes without @TestParallel or @TestSerial in parallel.")
       private boolean defaultParallel;
+
+      @Option(name = "-parallel-methods",
+          usage = "EXPERIMENTAL: Run methods within a class in parallel.")
+      private boolean parallelMethods;
+
+      @Option(name = "-default-concurrency",
+          usage = "Specify how to parallelize running tests.")
+      private Concurrency defaultConcurrency;
 
       private int parallelThreads = 0;
 
@@ -721,13 +752,16 @@ public class ConsoleRunnerImpl {
       exit(1);
     }
 
+    options.defaultConcurrency = computeConcurrencyOption(options.defaultConcurrency,
+        options.defaultParallel, options.parallelMethods);
+
     ConsoleRunnerImpl runner =
         new ConsoleRunnerImpl(options.failFast,
             options.outputMode,
             options.xmlReport,
             options.perTestTimer,
             options.outdir,
-            options.defaultParallel,
+            options.defaultConcurrency,
             options.parallelThreads,
             options.testShard,
             options.numTestShards,
@@ -751,6 +785,29 @@ public class ConsoleRunnerImpl {
     }
 
     runner.run(tests);
+  }
+
+  /**
+   * Used to convert the legacy -default-parallel and -parallel-methods options to the new
+   * style -default-concurrency values
+   */
+  @VisibleForTesting
+  static Concurrency computeConcurrencyOption(Concurrency defaultConcurrency,
+      boolean defaultParallel, boolean parallelMethods) {
+
+    if (defaultConcurrency != null) {
+      // -default-concurrency option present - use it.
+      return defaultConcurrency;
+    }
+
+    // Fall Back to using -default-parallel and -parallel-methods
+    if (!defaultParallel) {
+      return Concurrency.SERIAL;
+    }
+    if (parallelMethods) {
+      return Concurrency.PARALLEL_BOTH;
+    }
+    return Concurrency.PARALLEL_CLASSES;
   }
 
   public static final Predicate<Constructor<?>> IS_PUBLIC_CONSTRUCTOR =
